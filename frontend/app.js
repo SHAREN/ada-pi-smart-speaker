@@ -1030,7 +1030,19 @@ function handleControl(event) {
     case "ready":
       window.idleFace?.setConnecting(false);
       setConnected(true);
-      connectionStatus.textContent = "Connected — listening";
+      connectionStatus.textContent = "Connected — waiting for session state";
+      break;
+    case "session_state":
+      if (event.state === "standby") {
+        connectionStatus.textContent = "Standby — say Okay Nabu";
+        microphoneStatus.textContent = "Local wake-word only";
+      } else if (event.state === "active") {
+        connectionStatus.textContent = "Active — full duplex";
+        microphoneStatus.textContent = "On — streaming to Gemini";
+      } else if (event.state === "closing") {
+        connectionStatus.textContent = "Closing conversation…";
+        microphoneStatus.textContent = "Local only";
+      }
       break;
     case "speech_started":
       microphoneStatus.textContent = "Speech detected";

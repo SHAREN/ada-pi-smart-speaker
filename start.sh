@@ -7,7 +7,8 @@ ENV_FILE="$PROJECT_DIR/.env"
 HOST="${ADA_HOST:-0.0.0.0}"
 PORT="${ADA_PORT:-8000}"
 VIDEO_MODE="${ADA_VIDEO_MODE:-activity}"
-KIOSK_URL="http://localhost:$PORT"
+UI_MODE="${ADA_UI_MODE:-}"
+KIOSK_URL=""
 CHROMIUM_PROFILE="${ADA_CHROMIUM_PROFILE:-$PROJECT_DIR/.chromium-kiosk}"
 START_HOME_ASSISTANT="${ADA_START_HOME_ASSISTANT:-}"
 HOME_ASSISTANT_COMPOSE_FILE="${ADA_HOME_ASSISTANT_COMPOSE_FILE:-}"
@@ -93,6 +94,9 @@ HOME_ASSISTANT_COMPOSE_FILE="${HOME_ASSISTANT_COMPOSE_FILE:-$(env_value ADA_HOME
 HOME_ASSISTANT_COMPOSE_FILE="${HOME_ASSISTANT_COMPOSE_FILE:-$PROJECT_DIR/../homeassistant/compose.yaml}"
 HOME_ASSISTANT_URL="${HOME_ASSISTANT_URL:-$(env_value HOME_ASSISTANT_URL)}"
 HOME_ASSISTANT_URL="${HOME_ASSISTANT_URL:-http://127.0.0.1:8123}"
+UI_MODE="${ADA_UI_MODE:-$(env_value ADA_UI_MODE)}"
+UI_MODE="${UI_MODE:-full}"
+KIOSK_URL="http://localhost:$PORT/?ui=$UI_MODE"
 
 start_home_assistant
 
@@ -144,14 +148,32 @@ if [[ "$READY" != true ]]; then
   exit 1
 fi
 
-"$CHROMIUM_BIN" \
-  --kiosk \
-  --no-first-run \
-  --disable-session-crashed-bubble \
-  --autoplay-policy=no-user-gesture-required \
-  --use-fake-ui-for-media-stream \
-  --user-data-dir="$CHROMIUM_PROFILE" \
-  "$KIOSK_URL" &
+ACTIVE_CHROMIUM_PROFILE="$CHROMIUM_PROFILE"
+if [[ "$UI_MODE" == "voice-only" ]]; then
+  ACTIVE_CHROMIUM_PROFILE="${CHROMIUM_PROFILE}-voice-only"
+fi
+
+CHROMIUM_ARGS=(
+  --no-first-run
+  --disable-session-crashed-bubble
+  --autoplay-policy=no-user-gesture-required
+  --use-fake-ui-for-media-stream
+  --disable-background-timer-throttling
+  --disable-renderer-backgrounding
+  --user-data-dir="$ACTIVE_CHROMIUM_PROFILE"
+)
+if [[ "$UI_MODE" == "voice-only" ]]; then
+  CHROMIUM_ARGS+=(
+    --app="$KIOSK_URL"
+    --start-minimized
+    --window-size=1,1
+    --window-position=-32000,-32000
+  )
+else
+  CHROMIUM_ARGS+=(--kiosk "$KIOSK_URL")
+fi
+
+"$CHROMIUM_BIN" "${CHROMIUM_ARGS[@]}" &
 BROWSER_PID=$!
 
 # Closing either side closes the other. This also handles the on-screen Exit

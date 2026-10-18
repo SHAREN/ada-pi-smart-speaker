@@ -28,6 +28,8 @@ class LiveSessionManager:
         self._connected = asyncio.Event()
         self._subscribers: set[asyncio.Queue[ProviderEvent]] = set()
         self._generation = 0
+        self.reconnect_count = 0
+        self.fresh_session_count = 0
         self.status = "stopped"
         self.last_error = ""
 
@@ -83,10 +85,11 @@ class LiveSessionManager:
             if self._stopping:
                 break
             if generation != self._generation:
-                # Prompt changes require a fresh session instead of resuming the
-                # old setup/system instruction.
+                # An explicit fresh-session request (or prompt change) must not
+                # resume the previous conversational context.
                 generation = self._generation
                 handle = None
+            self.reconnect_count += 1
             self.status = "reconnecting"
             await asyncio.sleep(delay)
             delay = min(15.0, delay * 2)
@@ -134,6 +137,35 @@ class LiveSessionManager:
         provider = self.provider
         if provider is not None:
             await provider.close()
+
+    async def fresh_session(self, *, timeout: float = 12.0) -> None:
+        """Drop conversational resumption state and establish a clean warm session."""
+        self._generation += 1
+        self.fresh_session_count += 1
+        self._connected.clear()
+        provider = self.provider
+        if provider is not None:
+            await provider.close()
+        await asyncio.wait_for(self._connected.wait(), timeout=timeout)
+
+    def snapshot(self) -> dict[str, Any]:
+        provider = self.provider
+        return {
+            "status": self.status,
+            "last_error": self.last_error,
+            "generation": self._generation,
+            "reconnect_count": self.reconnect_count,
+            "fresh_session_count": self.fresh_session_count,
+            "connected": self._connected.is_set(),
+            "has_provider": provider is not None,
+            "web_search_enabled": bool(
+                getattr(provider, "enable_web_tools", False) or getattr(provider, "enable_google_search", False)
+            ) if provider else False,
+            "google_grounding_enabled": bool(getattr(provider, "enable_google_search", False)) if provider else False,
+            "ha_mcp_tool_count": int(getattr(provider, "_ha_tool_count", 0) or 0) if provider else 0,
+            "web_tool_calls": int(getattr(provider, "_web_tool_calls", 0) or 0) if provider else 0,
+            "ha_tool_calls": int(getattr(provider, "_ha_tool_calls", 0) or 0) if provider else 0,
+        }
 
     async def stop(self) -> None:
         self._stopping = True

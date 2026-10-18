@@ -6,13 +6,19 @@ import abc
 import asyncio
 import logging
 import os
+import re
 import time
+import unicodedata
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
 from google import genai
 from google.genai import types
+
+from .ha_mcp_voice import VOICE_TOOL_NAMES, call_voice_tool, get_voice_tool_declarations
+from .speaker_clock import CLOCK_TOOL_DECLARATIONS, CLOCK_TOOL_NAMES, speaker_clock
+from .web_tools import WEB_TOOL_DECLARATIONS, web_read, web_search
 
 logger = logging.getLogger("voice.provider")
 
@@ -29,6 +35,48 @@ EXPRESSION_NAMES = (
     "serious",
     "alert",
 )
+
+_END_COMMANDS = {
+    "закончи", "заканчивай", "закончить", "заверши", "завершить",
+    "закрой", "закрыть", "прекрати", "прекратить", "перестань", "перестать",
+    "хватит", "отключись", "отключиться",
+}
+_END_CONTEXT_STEMS = ("разговор", "диалог", "сесси", "слуш")
+
+
+def _normalize_utterance(value: str) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("ё", "е")
+    text = re.sub(r"[^0-9a-zа-я]+", " ", text)
+    return " ".join(text.split())
+
+
+def _explicit_end_request(text: str) -> bool:
+    """Require a clear current request to close the listening session.
+
+    Past-tense discussion such as «Почему ты завершил разговор?» must not
+    accidentally authorize the model's end_conversation tool call, while
+    natural Russian requests such as «стоп» or «хочу, чтобы ты завершил
+    разговор» should still work.
+    """
+    normalized = _normalize_utterance(text)
+    tokens = normalized.split()
+    if not tokens:
+        return False
+    if normalized in {"стоп", "все стоп", "всё стоп"}:
+        return True
+    if "не" in tokens and any(stem in normalized for stem in ("заканч", "заверш", "закры", "прекрат", "перестан")):
+        return False
+    command_indexes = [index for index, token in enumerate(tokens) if token in _END_COMMANDS]
+    if command_indexes and any(stem in normalized for stem in _END_CONTEXT_STEMS):
+        if not all("не" in tokens[max(0, index - 2):index] for index in command_indexes):
+            return True
+    request_lead = any(
+        phrase in normalized
+        for phrase in ("хочу чтобы ты", "прошу тебя", "командую", "давай", "можешь")
+    )
+    end_verb = any(stem in normalized for stem in ("законч", "заверш", "закры", "прекрат", "отключ"))
+    return bool(request_lead and end_verb and any(stem in normalized for stem in _END_CONTEXT_STEMS))
+
 
 DEFAULT_ADA_INSTRUCTIONS = """You are Ada, a polished, highly capable voice assistant running on a Raspberry Pi desk companion.
 
@@ -85,10 +133,27 @@ class GeminiLiveProvider(RealtimeProvider):
         self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         self.model = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
         self.voice = os.environ.get("GEMINI_LIVE_VOICE", "Kore")
+        self.language_code = os.environ.get("GEMINI_LIVE_LANGUAGE", "ru-RU").strip() or "ru-RU"
+        self.input_language_codes = [
+            code.strip()
+            for code in os.environ.get("GEMINI_INPUT_LANGUAGE_CODES", "ru-RU").split(",")
+            if code.strip()
+        ] or ["ru-RU"]
+        self.input_custom_vocabulary = [
+            phrase.strip()
+            for phrase in os.environ.get(
+                "GEMINI_INPUT_CUSTOM_VOCABULARY", "Окей Набу,Набу,Okay Nabu,OK Nabu"
+            ).split(",")
+            if phrase.strip()
+        ]
         self.video_resolution = os.environ.get("GEMINI_VIDEO_RESOLUTION", "high").lower()
+        self.voice_only = os.environ.get("ADA_UI_MODE", "full").strip().lower() == "voice-only"
         base_instructions = instructions or os.environ.get("GEMINI_LIVE_INSTRUCTIONS") or DEFAULT_ADA_INSTRUCTIONS
         self.instructions = (
             f"{base_instructions}\n\n"
+            "Language policy: always speak Russian (ru-RU) in normal conversation, even if the user mixes in English words. "
+            "Assume the user's spoken input is Russian unless they explicitly say they are switching languages. When audio is ambiguous, noisy, distant, or phonetically unclear, prefer the most plausible Russian interpretation rather than Portuguese, English, Spanish, or another language. "
+            "Use another language only when the user explicitly asks for a translation, pronunciation, quotation, or language exercise; otherwise immediately continue in Russian. "
             "Your name is Ada. You have a visible animated face. Use the "
             "set_facial_expression tool to select the expression that best matches "
             "your response and attitude. Call it once at the beginning of every spoken "
@@ -101,8 +166,34 @@ class GeminiLiveProvider(RealtimeProvider):
             "guess an object's identity from an ambiguous or blurred view; briefly "
             "ask the user to hold it steady or move it closer instead. When the user "
             "asks what habits are tracked, their habit status, or their progress, always "
-            "call get_habit_status and ground the answer in its current result."
+            "call get_habit_status and ground the answer in its current result. "
+            "If the user explicitly wants to end, close, or stop this voice conversation/listening session, "
+            "call end_conversation exactly once. Do not use end_conversation for stopping media, timers, "
+            "devices, or merely because a normal command is complete. After a successful end_conversation "
+            "tool result, say one very short farewell without asking another question. "
+            "If you expect noticeable waiting because of search, multiple tools, or nontrivial analysis, "
+            "call thinking_signal once before that work. Do not call thinking_signal for simple direct replies. "
+            "You have web_search and web_read for fresh public internet information. Use web_search when the user asks to search the web, "
+            "for current news, prices, schedules, changing facts, or when freshness matters. After a successful search, answer from the returned titles/snippets and name the useful source naturally when relevant; if the snippets are insufficient, call web_read on one or two promising results before answering. Never respond with a generic suggestion to check websites when usable search results were returned. If search actually fails, say briefly that the live web lookup failed instead of inventing current facts. Do not use web search to infer "
+            "the state of the user's home. You also have a restricted Home Assistant MCP toolset. Treat Home Assistant as "
+            "authoritative for the user's devices and home state. For ordinary low-risk household commands such as lights, switches, "
+            "fans, covers, climate, media players, vacuums and similar controls: if the user's intent and target are clear, execute the "
+            "requested action immediately without asking for confirmation, without saying what you are about to do, and without asking "
+            "an unnecessary follow-up question. If the exact entity_id is unknown, use ha_search silently to resolve the spoken name/room "
+            "and then act. Use ha_get_state when it materially helps, but do not read state first just to seek reassurance. Only ask one "
+            "short clarifying question in Russian when there are genuinely multiple plausible targets or the requested target/action is "
+            "actually ambiguous. Never claim a device changed until the Home Assistant tool returns success. After a successful simple "
+            "control command, keep the spoken acknowledgement extremely short; do not repeat the command or ask whether anything else is "
+            "needed. Never attempt to work around a blocked Home Assistant tool by using the internet. "
+            "You also have local smart-speaker clock tools. Use get_local_time for current local date/time instead of guessing or web search. "
+            "For a clear timer or alarm request, create it immediately without confirmation. Timers and alarms run locally and survive the conversation returning to standby. "
+            "Use list_timers when asked what is active, and cancel_timer only for the timer/alarm the user actually asked to cancel. Keep timer/alarm acknowledgements brief."
         )
+        if self.voice_only:
+            self.instructions += (
+                "\nVoice-only mode is enabled. There is no visible assistant face or user interface to manage. "
+                "Do not use or refer to facial expressions, screen controls, or visual UI state."
+            )
         self._client: Any = None
         self._session_context: Any = None
         self._session: Any = None
@@ -113,12 +204,40 @@ class GeminiLiveProvider(RealtimeProvider):
         self.go_away_time_left: str | None = None
         self.office_state_getter = office_state_getter
         self.habit_state_getter = habit_state_getter
+        # Native Gemini Google Search grounding is optional because some API projects
+        # reject Live setup with a separate grounding quota.  ADA's local web tools
+        # are the default internet path and do not consume that quota.
+        self.enable_google_search = os.environ.get("GEMINI_GOOGLE_SEARCH", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self.enable_web_tools = os.environ.get("ADA_WEB_TOOLS", "true").strip().lower() in {"1", "true", "yes", "on"}
+        self._last_user_transcript = ""
+        self._last_user_transcript_at = 0.0
+        self._ha_tool_count = 0
+        self._web_tool_calls = 0
+        self._ha_tool_calls = 0
+
+    def _effective_user_transcript(self, current: str, *, ttl_seconds: float = 6.0) -> str:
+        text = str(current or "").strip()
+        if text:
+            return text
+        if self._last_user_transcript and (time.monotonic() - self._last_user_transcript_at) <= ttl_seconds:
+            return self._last_user_transcript
+        return ""
 
     async def connect(self, resumption_handle: str | None = None) -> None:
         if not self.api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
 
-        self._client = genai.Client(api_key=self.api_key)
+        proxy_url = os.environ.get("GEMINI_PROXY_URL", "").strip()
+        if proxy_url:
+            self._client = genai.Client(
+                api_key=self.api_key,
+                http_options=types.HttpOptions(
+                    async_client_args={"proxy": proxy_url},
+                ),
+            )
+            logger.info("session=%s Gemini Live proxy enabled", self.session_id)
+        else:
+            self._client = genai.Client(api_key=self.api_key)
         config = {
             "response_modalities": ["AUDIO"],
             "media_resolution": (
@@ -127,9 +246,13 @@ class GeminiLiveProvider(RealtimeProvider):
                 else types.MediaResolution.MEDIA_RESOLUTION_LOW
             ),
             "system_instruction": self.instructions,
-            "input_audio_transcription": {},
+            "input_audio_transcription": {
+                "language_codes": self.input_language_codes,
+                "custom_vocabulary": self.input_custom_vocabulary,
+            },
             "output_audio_transcription": {},
             "speech_config": {
+                "language_code": self.language_code,
                 "voice_config": {
                     "prebuilt_voice_config": {"voice_name": self.voice},
                 }
@@ -140,17 +263,16 @@ class GeminiLiveProvider(RealtimeProvider):
                 "activity_handling": types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
                 "automatic_activity_detection": {
                     "disabled": False,
-                    # Speaker echo can otherwise look like a new user turn and
-                    # make Ada interrupt herself. LOW still supports barge-in,
-                    # but requires stronger evidence that speech has started.
+                    # The P610 AEC path already removes speaker playback, so use
+                    # high start sensitivity to avoid missing quieter near-end speech.
                     "start_of_speech_sensitivity": (
-                        types.StartSensitivity.START_SENSITIVITY_LOW
+                        types.StartSensitivity.START_SENSITIVITY_HIGH
                     ),
                     "end_of_speech_sensitivity": (
                         types.EndSensitivity.END_SENSITIVITY_HIGH
                     ),
                     "prefix_padding_ms": 200,
-                    "silence_duration_ms": 500,
+                    "silence_duration_ms": 350,
                 },
             },
             # Native audio consumes context quickly. Sliding-window compression
@@ -230,19 +352,80 @@ class GeminiLiveProvider(RealtimeProvider):
                     ),
                     "behavior": types.Behavior.NON_BLOCKING,
                     "parameters_json_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+                }, {
+                    "name": "end_conversation",
+                    "description": (
+                        "Call only when the user explicitly wants to end, close, or stop the current voice "
+                        "conversation/listening session. Never use this to stop media, timers, devices, or "
+                        "merely because a normal request is complete."
+                    ),
+                    "behavior": types.Behavior.NON_BLOCKING,
+                    "parameters_json_schema": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {
+                                "type": "string",
+                                "description": "Short semantic reason the user wants to end this voice session."
+                            }
+                        },
+                        "additionalProperties": False,
+                    },
+                }, {
+                    "name": "thinking_signal",
+                    "description": (
+                        "Call once before work expected to leave the user waiting over about one second because "
+                        "it needs search, multiple tools, or nontrivial analysis. Never call it for a simple reply."
+                    ),
+                    "behavior": types.Behavior.NON_BLOCKING,
+                    "parameters_json_schema": {"type": "object", "properties": {}, "additionalProperties": False},
                 }]
             }],
         }
+
+        if self.voice_only:
+            declarations = config["tools"][0]["function_declarations"]
+            config["tools"][0]["function_declarations"] = [
+                item for item in declarations if item.get("name") != "set_facial_expression"
+            ]
+
+        config["tools"][0]["function_declarations"].extend(CLOCK_TOOL_DECLARATIONS)
+
+        if self.enable_web_tools:
+            config["tools"][0]["function_declarations"].extend(WEB_TOOL_DECLARATIONS)
+
+        # Extend the local ADA functions with a deliberately restricted Home
+        # Assistant MCP catalog.  Discovery failure must not take down ordinary
+        # voice/chat or internet search.
+        if os.environ.get("HA_MCP_URL", "").strip():
+            try:
+                ha_declarations = await asyncio.wait_for(
+                    get_voice_tool_declarations(), timeout=6.0
+                )
+                config["tools"][0]["function_declarations"].extend(ha_declarations)
+                self._ha_tool_count = len(ha_declarations)
+            except Exception as exc:
+                self._ha_tool_count = 0
+                logger.warning("session=%s HA MCP catalog unavailable: %s", self.session_id, exc)
+
+        # Google Search is handled natively by Gemini Live and can coexist with
+        # custom function declarations in the same session.
+        if self.enable_google_search:
+            config["tools"].insert(0, {"google_search": {}})
+
         self._session_context = self._client.aio.live.connect(
             model=self.model,
             config=config,
         )
         self._session = await self._session_context.__aenter__()
         logger.info(
-            "session=%s Gemini Live session connected (model=%s, voice=%s, video=%s)",
+            "session=%s Gemini Live session connected (model=%s, voice=%s, language=%s, video=%s, internet_tools=%s, google_grounding=%s, ha_tools=%d)",
             self.session_id, self.model,
             self.voice,
+            self.language_code,
             self.video_resolution,
+            self.enable_web_tools,
+            self.enable_google_search,
+            self._ha_tool_count,
         )
 
     async def send_audio(self, pcm16: bytes) -> None:
@@ -304,6 +487,21 @@ class GeminiLiveProvider(RealtimeProvider):
                     self.go_away_time_left = str(message.go_away.time_left or "")
                     yield ProviderEvent("go_away", {"time_left": self.go_away_time_left})
                     return
+
+                # Consume input transcription before function calls from the same
+                # server message.  This gives the mutation guard the freshest
+                # possible wording and fails closed when Gemini has not emitted
+                # transcription yet.
+                content = message.server_content
+                if content is not None:
+                    transcription = content.input_transcription
+                    if transcription and transcription.text:
+                        input_transcript += transcription.text
+                        current_text = input_transcript.strip()
+                        if current_text:
+                            self._last_user_transcript = current_text
+                            self._last_user_transcript_at = time.monotonic()
+
                 tool_call = message.tool_call
                 if tool_call and tool_call.function_calls:
                     function_responses = []
@@ -324,6 +522,59 @@ class GeminiLiveProvider(RealtimeProvider):
                             result = {"output": "Observation delivered to the habit monitor"}
                         elif call.name == "get_habit_status" and self.habit_state_getter is not None:
                             result = {"output": self.habit_state_getter()}
+                        elif call.name == "end_conversation":
+                            reason = " ".join(str((call.args or {}).get("reason", "")).split())[:240]
+                            current_utterance = self._effective_user_transcript(input_transcript)
+                            if _explicit_end_request(current_utterance):
+                                yield ProviderEvent("semantic_end_requested", {"reason": reason})
+                                result = {
+                                    "success": True,
+                                    "instruction": (
+                                        "Say one very short farewell now, without a question or more tools. "
+                                        "The local voice session will close after your farewell audio."
+                                    ),
+                                }
+                            else:
+                                logger.warning(
+                                    "session=%s semantic end blocked transcript=%r model_reason=%r",
+                                    self.session_id,
+                                    current_utterance[:300],
+                                    reason,
+                                )
+                                result = {
+                                    "success": False,
+                                    "blocked": True,
+                                    "error": (
+                                        "The current user utterance is not an explicit imperative request to end "
+                                        "the listening session. Continue the conversation normally."
+                                    ),
+                                }
+                        elif call.name == "thinking_signal":
+                            yield ProviderEvent("thinking_signal", {})
+                            result = {"success": True}
+                        elif call.name in CLOCK_TOOL_NAMES:
+                            result = await speaker_clock.call_tool(
+                                str(call.name),
+                                dict(call.args or {}),
+                            )
+                        elif call.name == "web_search":
+                            self._web_tool_calls += 1
+                            args = dict(call.args or {})
+                            result = await web_search(
+                                str(args.get("query") or ""),
+                                int(args.get("max_results") or 5),
+                                str(args.get("kind") or "text"),
+                            )
+                        elif call.name == "web_read":
+                            self._web_tool_calls += 1
+                            result = await web_read(str((call.args or {}).get("url") or ""))
+                        elif call.name in VOICE_TOOL_NAMES:
+                            self._ha_tool_calls += 1
+                            result = await call_voice_tool(
+                                str(call.name),
+                                dict(call.args or {}),
+                                transcript=self._effective_user_transcript(input_transcript),
+                            )
                         else:
                             result = {"error": "Unsupported or unavailable function"}
                         function_responses.append(types.FunctionResponse(
@@ -348,7 +599,6 @@ class GeminiLiveProvider(RealtimeProvider):
                         self.session_id, len(function_responses),
                     )
 
-                content = message.server_content
                 if content is None:
                     continue
 
@@ -366,10 +616,6 @@ class GeminiLiveProvider(RealtimeProvider):
                     # Any audio/transcript accompanying an interruption belongs
                     # to the cancelled response and must not restart playback.
                     continue
-
-                transcription = content.input_transcription
-                if transcription and transcription.text:
-                    input_transcript += transcription.text
 
                 output_transcription = content.output_transcription
                 if output_transcription and output_transcription.text:

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run ADA Pi voice-stack watchdog every 30 seconds
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=ada-voice-watchdog.service
+
+[Install]
+WantedBy=timers.target

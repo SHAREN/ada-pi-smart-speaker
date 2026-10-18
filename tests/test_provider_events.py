@@ -1,3 +1,4 @@
+import time
 import unittest
 from pathlib import Path
 
@@ -70,18 +71,68 @@ class HabitStatusToolSession(ExpressionToolSession):
         self.provider._closed=True
 
 
+class EndConversationToolSession(ExpressionToolSession):
+    async def receive(self):
+        yield types.LiveServerMessage(
+            server_content=types.LiveServerContent(
+                input_transcription=types.Transcription(text="заверши разговор"),
+            ),
+            tool_call=types.LiveServerToolCall(function_calls=[
+                types.FunctionCall(id="end-1", name="end_conversation", args={"reason": "user said goodbye"})
+            ]),
+        )
+        self.provider._closed = True
+
+
+class BlockedEndConversationToolSession(ExpressionToolSession):
+    async def receive(self):
+        yield types.LiveServerMessage(
+            server_content=types.LiveServerContent(
+                input_transcription=types.Transcription(text="Почему ты завершил разговор?"),
+            ),
+            tool_call=types.LiveServerToolCall(function_calls=[
+                types.FunctionCall(id="end-blocked-1", name="end_conversation", args={"reason": "user is discussing the previous close"})
+            ]),
+        )
+        self.provider._closed = True
+
+
+class ThinkingSignalToolSession(ExpressionToolSession):
+    async def receive(self):
+        yield types.LiveServerMessage(tool_call=types.LiveServerToolCall(function_calls=[
+            types.FunctionCall(id="think-1", name="thinking_signal", args={})
+        ]))
+        self.provider._closed = True
+
+
 class ProviderEventTests(unittest.IsolatedAsyncioTestCase):
     def test_live_config_guards_long_full_duplex_sessions(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "backend/realtime_provider.py").read_text()
-        self.assertIn("START_SENSITIVITY_LOW", source)
+        self.assertIn("START_SENSITIVITY_HIGH", source)
         self.assertIn('"prefix_padding_ms": 200', source)
         self.assertIn("ActivityHandling.START_OF_ACTIVITY_INTERRUPTS", source)
-        self.assertIn('"silence_duration_ms": 500', source)
+        self.assertIn('"silence_duration_ms": 350', source)
+        self.assertIn('"language_code": self.language_code', source)
+        self.assertIn('"language_codes": self.input_language_codes', source)
+        self.assertIn('"custom_vocabulary": self.input_custom_vocabulary', source)
+        provider = GeminiLiveProvider()
+        self.assertEqual(provider.language_code, "ru-RU")
+        self.assertEqual(provider.input_language_codes, ["ru-RU"])
+        self.assertIn("Окей Набу", provider.input_custom_vocabulary)
+        self.assertIn("Okay Nabu", provider.input_custom_vocabulary)
         self.assertIn("ContextWindowCompressionConfig", source)
         self.assertIn("SlidingWindow", source)
         self.assertIn("SessionResumptionConfig", source)
         self.assertIn("session_resumption_update", source)
         self.assertIn("message.go_away", source)
+
+    def test_recent_transcript_survives_turn_complete_for_tool_guard(self) -> None:
+        provider = GeminiLiveProvider()
+        provider._last_user_transcript = "включи свет на кухне"
+        provider._last_user_transcript_at = time.monotonic()
+        self.assertEqual(provider._effective_user_transcript(""), "включи свет на кухне")
+        provider._last_user_transcript_at = time.monotonic() - 7.0
+        self.assertEqual(provider._effective_user_transcript(""), "")
 
     async def test_interruption_discards_coalesced_stale_audio(self) -> None:
         provider = GeminiLiveProvider()
@@ -132,6 +183,38 @@ class ProviderEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events,[])
         self.assertEqual(session.responses[0].name,"get_habit_status")
         self.assertEqual(session.responses[0].response,{"output":snapshot})
+
+    async def test_end_conversation_tool_emits_semantic_end_event(self) -> None:
+        provider = GeminiLiveProvider()
+        session = EndConversationToolSession(provider)
+        provider._session = session
+        events = [event async for event in provider.events()]
+        self.assertEqual([(event.type, event.data) for event in events], [
+            ("semantic_end_requested", {"reason": "user said goodbye"})
+        ])
+        self.assertEqual(session.responses[0].name, "end_conversation")
+        self.assertTrue(session.responses[0].response["success"])
+
+    async def test_end_conversation_tool_is_blocked_for_bug_report_question(self) -> None:
+        provider = GeminiLiveProvider()
+        session = BlockedEndConversationToolSession(provider)
+        provider._session = session
+        events = [event async for event in provider.events()]
+        self.assertEqual(events, [])
+        self.assertEqual(session.responses[0].name, "end_conversation")
+        self.assertFalse(session.responses[0].response["success"])
+        self.assertTrue(session.responses[0].response["blocked"])
+
+    async def test_thinking_signal_tool_emits_local_event(self) -> None:
+        provider = GeminiLiveProvider()
+        session = ThinkingSignalToolSession(provider)
+        provider._session = session
+        events = [event async for event in provider.events()]
+        self.assertEqual([(event.type, event.data) for event in events], [
+            ("thinking_signal", {})
+        ])
+        self.assertEqual(session.responses[0].name, "thinking_signal")
+        self.assertTrue(session.responses[0].response["success"])
 
     async def test_video_frame_uses_live_video_input(self) -> None:
         class VideoSession:

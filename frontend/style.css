@@ -2,6 +2,8 @@
 * { box-sizing: border-box; }
 html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #000; }
 body { font-family: system-ui, sans-serif; user-select: none; touch-action: manipulation; }
+html.voice-only, html.voice-only body { background: transparent !important; }
+html.voice-only #face-stage { visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; width: 1px !important; height: 1px !important; inset: auto !important; overflow: hidden !important; }
 #face-stage { position: fixed; inset: 0; display: grid; place-items: center; overflow: hidden; background: #000; cursor: none; }
 #settings-toggle { position: fixed; z-index: 60; top: 18px; right: 18px; display: grid; place-items: center; width: 50px; height: 50px; padding: 11px; border: 1px solid #087ef2; border-radius: 50%; color: #aef8ff; background: rgba(0,20,30,.88); box-shadow: 0 0 14px rgba(23,223,255,.22); cursor: auto; opacity: .55; transition: opacity 180ms ease, transform 220ms ease; }
 #settings-toggle svg { width: 100%; height: 100%; fill: currentColor; }

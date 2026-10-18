@@ -5,3 +5,4 @@ __pycache__/
 .chromium-kiosk/
 logs/
 data/
+audio-debug/

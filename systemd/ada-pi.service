@@ -1,0 +1,23 @@
+[Unit]
+Description=ADA Pi smart-speaker service
+After=network-online.target pipewire-pulse.service wireplumber.service ada-p610-aec.service graphical-session.target
+Wants=network-online.target
+Requires=ada-p610-aec.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ada-pi
+Environment=XDG_RUNTIME_DIR=%t
+Environment=PULSE_SINK=ada_aec_sink
+Environment=PULSE_SOURCE=ada_aec_source
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=ADA_HOST=127.0.0.1
+Environment=ADA_PORT=18765
+Environment=ADA_VIDEO_MODE=activity
+Environment=ADA_CHROMIUM_PROFILE=%h/.config/ada-pi-chromium
+ExecStart=%h/ada-pi/start.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

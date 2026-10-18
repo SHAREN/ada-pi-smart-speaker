@@ -1,6 +1,7 @@
 (() => {
   "use strict";
 
+  if (document.documentElement.classList.contains("voice-only")) return;
   const face = document.querySelector("#idle-face");
   if (!face) return;
   const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
