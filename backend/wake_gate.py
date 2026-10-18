@@ -42,10 +42,10 @@ class WakeSessionGate:
 
         # Production values copied from proxy39.
         self.wake_threshold = _env_float("ADA_WAKE_THRESHOLD", 0.85, 0.0, 1.0)
-        self.stop_threshold = _env_float("ADA_STOP_THRESHOLD", 0.50, 0.0, 1.0)
-        self.refractory_seconds = _env_float("ADA_WAKE_REFRACTORY_SECONDS", 2.0, 0.0, 30.0)
+        self.stop_threshold = _env_float("ADA_STOP_THRESHOLD", 0.60, 0.0, 1.0)
+        self.refractory_seconds = _env_float("ADA_WAKE_REFRACTORY_SECONDS", 1.0, 0.0, 30.0)
         self.stop_guard_seconds = _env_float("ADA_STOP_GUARD_SECONDS", 0.25, 0.0, 5.0)
-        self.end_cue_wake_guard_seconds = _env_float("ADA_END_CUE_WAKE_GUARD_SECONDS", 1.0, 0.0, 5.0)
+        self.end_cue_wake_guard_seconds = _env_float("ADA_END_CUE_WAKE_GUARD_SECONDS", 0.35, 0.0, 5.0)
         self.pre_roll_seconds = _env_float("ADA_AUDIO_PREROLL_SECONDS", 2.0, 0.0, 5.0)
         # Wake is an arming command, never user content. Do not forward any
         # pre-wake overlap to Gemini after the activation cue.
@@ -76,6 +76,7 @@ class WakeSessionGate:
         self.stop_count = 0
         self.idle_count = 0
         self.semantic_end_count = 0
+        self.last_stop_probability = 0.0
 
     @property
     def active(self) -> bool:
@@ -219,14 +220,19 @@ class WakeSessionGate:
             if self.state == "active":
                 if time.monotonic() < self._stop_guard_until:
                     self._stop_model.reset()
+                    self.last_stop_probability = 0.0
                     continue
                 if not allow_stop:
-                    # Never accumulate assistant playback / residual echo inside
-                    # the Stop detector. A fresh local-speech VAD window must be
-                    # present before the detector can make a closing decision.
+                    # Do not accumulate assistant playback / TV-only residuals in
+                    # the Stop detector. A new near-end window starts fresh.
                     self._stop_model.reset()
+                    self.last_stop_probability = 0.0
                     continue
-                if self._stop_model.process_streaming(features):
+                probability = self._stop_model.process_streaming_prob(features)
+                if probability is None:
+                    continue
+                self.last_stop_probability = float(probability)
+                if self.last_stop_probability > self.stop_threshold:
                     self.begin_close("stop")
                     return "stop"
                 continue
@@ -249,6 +255,7 @@ class WakeSessionGate:
             "stop_word": "Stop",
             "wake_threshold": self.wake_threshold,
             "stop_threshold": self.stop_threshold,
+            "last_stop_probability": round(self.last_stop_probability, 4),
             "refractory_seconds": self.refractory_seconds,
             "stop_guard_seconds": self.stop_guard_seconds,
             "end_cue_wake_guard_seconds": self.end_cue_wake_guard_seconds,

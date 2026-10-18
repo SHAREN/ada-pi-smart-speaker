@@ -35,6 +35,7 @@ from .wake_gate import WakeSessionGate
 from .audio_debug import AudioDebugSession, cleanup_audio_debug
 from .speaker_clock import speaker_clock
 from .tv_reference_gate import TVReferenceGate
+from .conversation_memory import ConversationMemory
 
 ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = Path(os.environ.get("ADA_LOG_DIR", ROOT / "logs"))
@@ -114,8 +115,19 @@ def habit_tool_snapshot() -> dict[str, object]:
     return {"window_days": 7, "established_requirements": {"occurrences": 10, "days": 3}, "habits": habits}
 
 
+conversation_memory = ConversationMemory(ROOT / "data" / "voice-conversation-memory.json")
+
+
+def ada_system_prompt() -> str:
+    base = posture_store.system_prompt(DEFAULT_ADA_INSTRUCTIONS)
+    memory = conversation_memory.prompt_context()
+    if not memory:
+        return base
+    return f"{base}\n\n{memory}"
+
+
 live_manager = LiveSessionManager(
-    lambda: posture_store.system_prompt(DEFAULT_ADA_INSTRUCTIONS),
+    ada_system_prompt,
     office_state_getter=lambda: office_light_monitor.snapshot(),
     habit_state_getter=habit_tool_snapshot,
 )
@@ -256,6 +268,7 @@ async def voice_status() -> dict[str, object]:
         "provider": live_manager.snapshot(),
         "runtime": dict(VOICE_RUNTIME_STATE),
         "tv_reference_gate": tv_reference_gate.snapshot(),
+        "conversation_memory": conversation_memory.snapshot(),
         "clock": speaker_clock.snapshot(),
     }
 
@@ -645,6 +658,7 @@ async def voice_socket(browser: WebSocket) -> None:
     local_speech_detected = False
     local_speech_stop_grace_until = 0.0
     assistant_response_active = False
+    assistant_memory_parts: list[str] = []
     semantic_close_pending = False
     tv_gate_armed = False
     audio_debug_session: AudioDebugSession | None = None
@@ -665,6 +679,12 @@ async def voice_socket(browser: WebSocket) -> None:
                 **voice_gate.status(),
                 provider=live_manager.snapshot(),
             )
+
+    def remember_conversation_turn(role: str, text: str) -> None:
+        try:
+            conversation_memory.append(role, text)
+        except Exception:
+            logger.exception("failed to persist %s conversation turn", role)
 
     async def play_wake_cue() -> None:
         activation_cue_done.clear()
@@ -704,20 +724,16 @@ async def voice_socket(browser: WebSocket) -> None:
             # completed. Give the browser's small jitter queue time to drain.
             if reason == "semantic" and not clear_playback:
                 await asyncio.sleep(0.35)
-            fresh_task = asyncio.create_task(live_manager.fresh_session())
             if audio_debug_session is not None:
                 audio_debug_session.record_event("end_cue_started", {})
             await _play_voice_cue(END_CUE, "end")
             if audio_debug_session is not None:
                 audio_debug_session.record_event("end_cue_finished", {})
-            try:
-                await fresh_task
-                if audio_debug_session is not None:
-                    audio_debug_session.record_event("fresh_session", {})
-            except Exception as exc:
-                logger.warning("fresh Gemini standby was not ready after %s: %s", reason, exc)
-                if audio_debug_session is not None:
-                    audio_debug_session.record_event("fresh_session_failed", {"error": str(exc)})
+                audio_debug_session.record_event("conversation_context_preserved", {})
+            # Normal local session boundaries must not call fresh_session().
+            # Keeping the persistent Live session (and its resumption handle)
+            # preserves conversational context across Stop/idle/semantic close
+            # and removes the multi-second reconnect delay before the next wake.
             voice_gate.finish_standby()
             semantic_close_pending = False
             tv_gate_armed = False
@@ -849,12 +865,24 @@ async def voice_socket(browser: WebSocket) -> None:
                         voice_gate.remember_pre_roll(pcm16)
                     event = voice_gate.process_audio(
                         pcm16,
-                        # Stop is a dedicated local wake-word classifier and must
-                        # not depend on the browser amplitude VAD or TV matcher:
-                        # those gates can legitimately reject a quiet near-end
-                        # "Stop". Keep it disabled only while the wake cue itself
-                        # is playing to avoid a cue-tail false positive.
-                        allow_stop=activation_cue_done.is_set(),
+                        # Stop stays sensitive, but a single wakeword-like pattern
+                        # from TV/self playback must not close the session. During
+                        # assistant playback require independent near-end evidence;
+                        # while ADA is quiet, allow a modest RMS fallback as long as
+                        # the TV matcher is not actively classifying the frame as TV.
+                        allow_stop=(
+                            activation_cue_done.is_set()
+                            and (
+                                local_speech_detected
+                                or time.monotonic() < local_speech_stop_grace_until
+                                or tv_decision.near_end_hold
+                                or (
+                                    not assistant_response_active
+                                    and not tv_decision.suppress
+                                    and voice_gate.normalized_rms(pcm16) >= 0.006
+                                )
+                            )
+                        ),
                     )
                     if event == "wake":
                         tv_gate_armed = False
@@ -1072,6 +1100,7 @@ async def voice_socket(browser: WebSocket) -> None:
                     if video_mode == "activity":
                         await forward_video_frame(camera.latest_frame)
                 elif event.type == "response_interrupted":
+                    assistant_memory_parts.clear()
                     if not voice_gate.active:
                         continue
                     logger.warning(
@@ -1097,14 +1126,19 @@ async def voice_socket(browser: WebSocket) -> None:
                     await send_json(browser, "speech_stopped")
                 elif event.type == "assistant_transcript_delta":
                     if forward_audio and (voice_gate.active or semantic_close_pending):
-                        await send_json(browser, event.type, text=event.data["text"])
+                        text = str(event.data.get("text") or "")
+                        if text:
+                            assistant_memory_parts.append(text)
+                        await send_json(browser, event.type, text=text)
                 elif event.type == "user_transcript":
                     if voice_gate.active or semantic_close_pending:
-                        logger.info("session=%s user transcript=%r", session_id, event.data["text"])
+                        text = str(event.data.get("text") or "")
+                        logger.info("session=%s user transcript=%r", session_id, text)
                         if audio_debug_session is not None:
-                            audio_debug_session.record_event("user_transcript", {"text": event.data["text"]})
+                            audio_debug_session.record_event("user_transcript", {"text": text})
+                        remember_conversation_turn("user", text)
                         voice_gate.note_activity()
-                        await send_json(browser, event.type, text=event.data["text"])
+                        await send_json(browser, event.type, text=text)
                 elif event.type == "semantic_end_requested":
                     if voice_gate.active:
                         semantic_close_pending = True
@@ -1130,6 +1164,7 @@ async def voice_socket(browser: WebSocket) -> None:
                             name="ada-thinking-cue",
                         )
                 elif event.type == "response_started":
+                    assistant_memory_parts.clear()
                     if not (voice_gate.active or semantic_close_pending):
                         forward_audio = False
                         continue
@@ -1150,6 +1185,10 @@ async def voice_socket(browser: WebSocket) -> None:
                     logger.info("session=%s duplex response_completed", session_id)
                     if audio_debug_session is not None:
                         audio_debug_session.record_event("response_completed", {})
+                    if assistant_memory_parts:
+                        if voice_gate.active or semantic_close_pending:
+                            remember_conversation_turn("assistant", "".join(assistant_memory_parts))
+                        assistant_memory_parts.clear()
                     if voice_gate.active:
                         voice_gate.note_activity()
                     await send_json(browser, event.type)

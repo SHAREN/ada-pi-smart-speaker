@@ -41,9 +41,9 @@ class _FakeStopModel:
     def reset(self):
         self.reset_count += 1
 
-    def process_streaming(self, _features):
+    def process_streaming_prob(self, _features):
         self.process_count += 1
-        return True
+        return 0.9
 
 
 class LocalStopVadGateTests(unittest.TestCase):
@@ -55,6 +55,8 @@ class LocalStopVadGateTests(unittest.TestCase):
         gate._stop_guard_until = 0.0
         gate._features = _FakeFeatures()
         gate._stop_model = _FakeStopModel()
+        gate.stop_threshold = 0.60
+        gate.last_stop_probability = 0.0
         gate.closed_reason = None
 
         def begin_close(reason):
@@ -78,6 +80,15 @@ class LocalStopVadGateTests(unittest.TestCase):
         self.assertEqual(result, "stop")
         self.assertEqual(gate.closed_reason, "stop")
         self.assertEqual(gate._stop_model.process_count, 1)
+        self.assertEqual(gate.last_stop_probability, 0.9)
+
+    def test_stop_probability_below_calibrated_threshold_does_not_close(self):
+        gate = self._gate()
+        gate._stop_model.process_streaming_prob = lambda _features: 0.57
+        result = gate.process_audio(b"\x00\x00" * 160, allow_stop=True)
+        self.assertIsNone(result)
+        self.assertIsNone(gate.closed_reason)
+        self.assertEqual(gate.last_stop_probability, 0.57)
 
 
 if __name__ == "__main__":
