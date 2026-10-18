@@ -25,6 +25,7 @@ HEALTH_FILE = STATE_DIR / "voice-health.json"
 XDG_RUNTIME_DIR = "/run/user/1000"
 ADA_SERVICE = "ada-pi.service"
 AEC_SERVICE = "ada-p610-aec.service"
+TV_AEC_SERVICE = "ada-tv-aec.service"
 FAILURE_THRESHOLD = 2
 ADA_RESTART_COOLDOWN = 300.0
 AEC_RESTART_COOLDOWN = 120.0
@@ -129,6 +130,7 @@ def audio_nodes() -> dict[str, bool]:
         "p610_present": "Plantronics_Plantronics_P610" in joined,
         "aec_sink_present": "ada_aec_sink" in sinks,
         "aec_source_present": "ada_aec_source" in sources,
+        "tv_aec_source_present": "ada_tv_aec_source" in sources,
     }
 
 
@@ -152,6 +154,7 @@ def main() -> int:
     ha_mcp_tool_count = int(provider.get("ha_mcp_tool_count") or 0) if api_ok else 0
     smart_tools_ok = bool(web_search_ok and ha_mcp_tool_count >= 13)
     aec_ok = bool(audio["aec_source_present"] and audio["aec_sink_present"])
+    tv_aec_ok = bool(audio["tv_aec_source_present"])
     current_raw = runtime.get("raw_mic_chunks") if api_ok else None
     previous_raw = state.get("previous_raw_mic_chunks")
     mic_expected = bool(api_ok and browser_ok and audio["p610_present"] and aec_ok)
@@ -171,6 +174,7 @@ def main() -> int:
     api_failures = bump("api_failures", not api_ok)
     browser_failures = bump("browser_failures", api_ok and not browser_ok)
     aec_failures = bump("aec_failures", audio["p610_present"] and not aec_ok)
+    tv_aec_failures = bump("tv_aec_failures", audio["p610_present"] and not tv_aec_ok)
     provider_failures = bump("provider_failures", api_ok and not provider_ok)
     mic_failures = bump("mic_failures", mic_stale)
     if isinstance(current_raw, int):
@@ -180,7 +184,45 @@ def main() -> int:
     if aec_route.get("repaired"):
         actions.append({"action": "repin_aec_playback_to_p610", "ok": True, "detail": aec_route})
 
-    # AEC has its own isolated service, so repair it independently.
+    # The TV-reference AEC is the first capture stage. If it disappears, restore
+    # it first and then rebuild the P610 self-AEC so its source_master points at
+    # the newly-created ada_tv_aec_source instead of the physical fallback.
+    if tv_aec_failures >= FAILURE_THRESHOLD:
+        last = float(state.get("last_tv_aec_restart_at", 0) or 0)
+        if checked_at - last >= AEC_RESTART_COOLDOWN:
+            tv_ok, tv_output = restart_user_service(TV_AEC_SERVICE)
+            p610_ok = False
+            p610_output = ""
+            ada_ok = False
+            ada_output = ""
+            if tv_ok:
+                p610_ok, p610_output = restart_user_service(AEC_SERVICE)
+            if tv_ok and p610_ok:
+                # Recreating the capture sources invalidates Chromium's old
+                # recording stream. Reconnect ADA immediately instead of
+                # waiting for a later browser-stale watchdog cycle.
+                ada_ok, ada_output = restart_user_service(ADA_SERVICE)
+            state["last_tv_aec_restart_at"] = checked_at
+            if tv_ok and p610_ok and ada_ok:
+                state["tv_aec_failures"] = 0
+                state["aec_failures"] = 0
+                state["browser_failures"] = 0
+                state["mic_failures"] = 0
+                tv_aec_failures = 0
+                aec_failures = 0
+                browser_failures = 0
+                mic_failures = 0
+            actions.append({
+                "action": "restart_tv_aec_cascade",
+                "ok": bool(tv_ok and p610_ok and ada_ok),
+                "detail": {
+                    "tv_aec": tv_output[-500:],
+                    "p610_aec": p610_output[-500:],
+                    "ada": ada_output[-500:],
+                },
+            })
+
+    # P610 self-AEC has its own isolated service, so repair it independently.
     if aec_failures >= FAILURE_THRESHOLD:
         last = float(state.get("last_aec_restart_at", 0) or 0)
         if checked_at - last >= AEC_RESTART_COOLDOWN:
@@ -216,6 +258,7 @@ def main() -> int:
             api_ok
             and browser_ok
             and audio["p610_present"]
+            and tv_aec_ok
             and aec_ok
             and bool(aec_route.get("ok"))
             and provider_ok
@@ -226,6 +269,7 @@ def main() -> int:
             "ada_api": {"ok": api_ok, "failures": api_failures},
             "browser": {"ok": browser_ok, "failures": browser_failures},
             "p610": {"ok": audio["p610_present"]},
+            "tv_aec": {"ok": tv_aec_ok, "failures": tv_aec_failures},
             "aec": {"ok": aec_ok, "failures": aec_failures},
             "aec_playback_route": aec_route,
             "mic_capture": {

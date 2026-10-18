@@ -1,0 +1,14 @@
+[Unit]
+Description=ADA TV/HDMI reference echo cancellation
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Requires=pipewire.service pipewire-pulse.service wireplumber.service
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=%h/ada-pi/scripts/tv-aec-native.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

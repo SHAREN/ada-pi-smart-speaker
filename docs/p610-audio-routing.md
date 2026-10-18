@@ -85,22 +85,51 @@ systemctl --user status ada-p610-aec.service ada-pi.service
 
 When checking `pactl list sink-inputs`, the echo-cancel playback stream must ultimately be attached to the physical P610 sink, while unrelated media such as VLC should remain on whichever normal system output the user selected.
 
-## Planned TV / system-audio reference cancellation
+## TV / system-audio reference cancellation
 
-The next useful extension is to cancel TV/system playback from the P610 microphone as well. This is standard far-end/reference acoustic echo cancellation: instead of treating the TV as unknown background noise, feed the exact digital system playback signal into an AEC stage as the render/reference signal and subtract the correlated acoustic copy that arrives at the microphone.
+ADA now uses the system playback signal as an additional far-end reference so dialogue from the TV is less likely to be interpreted as the user. The implementation deliberately does **not** change the user's normal playback device.
 
-For this installation, the preferred design is a second AEC stage after the existing P610 self-echo stage:
+The live capture chain is:
 
-1. Stage 1 keeps removing ADA's own P610 playback from the P610 microphone.
-2. Stage 2 uses the monitor/reference signal of the user's normal system sink (for example HDMI feeding the TV) and removes that playback from the already-cleaned microphone.
-3. The final source is what wake-word detection and Gemini receive.
-4. System playback routing must remain user-controlled; the cancellation path must observe it rather than forcing the system default to another sink.
+1. `ada-tv-aec.service` starts `scripts/tv-aec-native.sh` after PipeWire/WirePlumber expose the P610. A native PipeWire WebRTC echo-cancel module runs in `monitor.mode`, observing the monitor of the current default system sink (normally HDMI/TV) while capturing the physical P610 microphone. It publishes `ada_tv_aec_source`.
+2. `ada-p610-aec.service` waits briefly for `ada_tv_aec_source` and then uses it as the capture master for the existing P610 self-echo AEC. If the TV layer is unavailable, it safely falls back to the physical P610 microphone.
+3. The final `ada_aec_source` therefore has two cascaded acoustic references: system/TV playback first, ADA's own P610 playback second.
+4. ADA playback remains pinned to `ada_aec_sink`/P610. Ordinary system audio remains on the user-selected sink and is never redirected to P610.
 
-PipeWire's native echo-cancel module supports a monitor mode that can take the current sink monitor as the reference instead of requiring applications to render through a special virtual sink. WebRTC AEC3 performs adaptive delay estimation between render and capture, which is important because HDMI/TV processing adds latency and that latency can change.
+The TV layer uses WebRTC `extended_filter` and `delay_agnostic` processing. Tests with explicit fixed HDMI delays, mono conversion, and a virtual render sink did not consistently beat monitor mode, so the production path leaves delay estimation adaptive.
 
-Important engineering constraints:
+### Reference-aware anti-barge-in gate
 
-- HDMI/TV playback and the USB P610 can have different latency and clock behavior, so delay/drift must be measured rather than hard-coded.
-- The existing P610 playback reference and the TV reference are different acoustic paths. Prefer cascaded stages or a true multi-reference/multi-channel design rather than simply summing the two references before a single one-channel adaptive filter.
-- Validate with recordings containing TV-only, user-only, and simultaneous TV+user speech. The goal is strong TV attenuation without damaging near-end speech or barge-in.
-- Keep the current working routing invariant unchanged: ordinary system audio follows the user's selected output; ADA playback remains pinned to P610.
+AEC alone does not perfectly remove distant TV speech. The important observed failure mode was not false wake-up in standby; it was residual TV dialogue being transcribed as new user speech during an ADA response, causing Gemini to interrupt itself.
+
+`backend/tv_reference_gate.py` adds a conservative second defense:
+
+- `parec @DEFAULT_MONITOR@` samples the exact system render reference at 16 kHz without changing playback routing.
+- While ADA is in standby, the gate learns a robust ratio between the delayed HDMI reference and the final post-AEC microphone residual. The current calibrated reference delay is 255 ms.
+- The first user turn after `Okay Nabu` is never gated. When ADA starts the first reply, the reference gate becomes armed for the remainder of that active voice session, covering both ADA playback and the pauses between turns where TV dialogue previously created fake user messages.
+- A frame consistent with the learned TV residual is replaced with equal-duration silence before being sent to Gemini. This preserves realtime timing while preventing TV dialogue from opening Gemini's speech detector.
+- A clear near-end rise opens the gate and holds it open for 0.9 s so a user's quieter syllables are not chopped. The minimum near-end threshold is intentionally conservative (`0.006` normalized RMS) and can be overridden with environment variables.
+- Provider/local `speech_started` and local Stop authorization also ignore frames currently classified as probable TV-only input.
+
+On the retained real TV-only capture, the calibrated gate would reject about 92% of 43 ms TV-only frames at the conservative `0.006` threshold. A separate real user-speech capture contains large peaks well above the threshold; the 0.9 s hold preserves the rest of the utterance after the first near-end rise.
+
+### Calibration findings
+
+- The HDMI-to-P610 acoustic delay is large. In one continuous controlled run it stayed very stable around 254.5–255.4 ms across consecutive two-second windows.
+- A frozen room FIR did not generalize well to later samples even though the delay stayed stable. The P610 itself appears to adapt its microphone gain/noise processing over time, so a one-time fixed impulse response is not a reliable production canceller.
+- A custom streaming FDAF improved recorded TV leakage by roughly 3–4 dB in conservative 16 kHz simulations; the best observed native WebRTC live run was better, so the custom filter was not put into production.
+- P610 exposes two capture channels but they were measured as bit-identical (`corr = 1.0`), so there is no independent microphone pair available for beamforming.
+
+### Recovery and verification
+
+The voice watchdog now treats `ada_tv_aec_source` as a separate health layer. If it disappears for repeated checks, it restarts `ada-tv-aec.service` first and then rebuilds `ada-p610-aec.service` so the cascade binds to the restored source. The P610 script no longer trusts a cached numeric PulseAudio module ID because PipeWire can recycle those IDs after restart.
+
+Useful checks:
+
+```bash
+systemctl --user status ada-tv-aec.service ada-p610-aec.service ada-pi.service
+wpctl status
+curl -s http://127.0.0.1:18765/api/voice/status
+```
+
+The expected invariant remains: **system audio -> user-selected output (normally HDMI); TV reference -> TV-AEC only; ADA playback -> P610; final ADA microphone -> TV-AEC -> P610-self AEC -> Gemini.**

@@ -33,6 +33,7 @@ from .office_lights import OfficeLightMonitor
 from .wake_gate import WakeSessionGate
 from .audio_debug import AudioDebugSession, cleanup_audio_debug
 from .speaker_clock import speaker_clock
+from .tv_reference_gate import TVReferenceGate
 
 ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = Path(os.environ.get("ADA_LOG_DIR", ROOT / "logs"))
@@ -118,10 +119,12 @@ live_manager = LiveSessionManager(
     habit_state_getter=habit_tool_snapshot,
 )
 voice_gate = WakeSessionGate(ROOT)
+tv_reference_gate = TVReferenceGate()
 VOICE_RUNTIME_STATE: dict[str, object] = {
     "browser_connected": False,
     "session_id": None,
     "assistant_response_active": False,
+    "tv_gate_armed": False,
     "cue": None,
     "last_event": None,
     "last_event_at": None,
@@ -176,6 +179,7 @@ async def start_oled_guard() -> None:
     global oled_guard_task
     oled_guard_task = asyncio.create_task(keep_oled_awake())
     cleanup_audio_debug(ROOT)
+    await tv_reference_gate.start()
     await live_manager.start()
     await speaker_clock.start(on_clock_fire)
     await pose_service.start()
@@ -197,6 +201,7 @@ async def stop_oled_guard() -> None:
     await speaker_clock.stop()
     vision_backend.close()
     await live_manager.stop()
+    await tv_reference_gate.stop()
     await camera.stop()
 
 
@@ -249,6 +254,7 @@ async def voice_status() -> dict[str, object]:
         "gate": voice_gate.status(),
         "provider": live_manager.snapshot(),
         "runtime": dict(VOICE_RUNTIME_STATE),
+        "tv_reference_gate": tv_reference_gate.snapshot(),
         "clock": speaker_clock.snapshot(),
     }
 
@@ -639,12 +645,14 @@ async def voice_socket(browser: WebSocket) -> None:
     local_speech_stop_grace_until = 0.0
     assistant_response_active = False
     semantic_close_pending = False
+    tv_gate_armed = False
     audio_debug_session: AudioDebugSession | None = None
 
     VOICE_RUNTIME_STATE.update(
         browser_connected=True,
         session_id=session_id,
         assistant_response_active=False,
+        tv_gate_armed=False,
     )
     _note_voice_event("browser_connected")
 
@@ -671,7 +679,7 @@ async def voice_socket(browser: WebSocket) -> None:
             await send_session_state()
 
     async def finalize_session(reason: str, *, clear_playback: bool) -> None:
-        nonlocal assistant_response_active, semantic_close_pending, audio_debug_session, local_speech_detected, local_speech_stop_grace_until
+        nonlocal assistant_response_active, semantic_close_pending, tv_gate_armed, audio_debug_session, local_speech_detected, local_speech_stop_grace_until
         async with finalize_lock:
             if voice_gate.state == "standby":
                 return
@@ -707,6 +715,8 @@ async def voice_socket(browser: WebSocket) -> None:
                     audio_debug_session.record_event("fresh_session_failed", {"error": str(exc)})
             voice_gate.finish_standby()
             semantic_close_pending = False
+            tv_gate_armed = False
+            VOICE_RUNTIME_STATE["tv_gate_armed"] = False
             local_speech_detected = False
             local_speech_stop_grace_until = 0.0
             speech_active.clear()
@@ -744,10 +754,11 @@ async def voice_socket(browser: WebSocket) -> None:
         return
 
     async def browser_to_provider() -> None:
-        nonlocal speech_clear_task, audio_debug_session, local_speech_detected, local_speech_stop_grace_until
+        nonlocal speech_clear_task, audio_debug_session, local_speech_detected, local_speech_stop_grace_until, tv_gate_armed
         raw_packet_count = 0
         forwarded_packet_count = 0
         last_audio_log = time.monotonic()
+        tv_gate_suppressing = False
         try:
             while True:
                 message = await browser.receive()
@@ -762,6 +773,36 @@ async def voice_socket(browser: WebSocket) -> None:
                     VOICE_RUNTIME_STATE["raw_mic_bytes"] = int(
                         VOICE_RUNTIME_STATE.get("raw_mic_bytes") or 0
                     ) + len(pcm16)
+                    if tv_gate_armed and voice_gate.active:
+                        tv_decision = tv_reference_gate.classify_active(pcm16)
+                    else:
+                        tv_decision = tv_reference_gate.observe(
+                            pcm16, learn=not voice_gate.active
+                        )
+                    if tv_decision.suppress != tv_gate_suppressing:
+                        tv_gate_suppressing = tv_decision.suppress
+                        logger.info(
+                            "session=%s TV reference gate %s mic=%.5f ref=%.5f "
+                            "expected=%.5f threshold=%.5f ratio=%.3f ready=%s",
+                            session_id,
+                            "suppressing" if tv_gate_suppressing else "open",
+                            tv_decision.mic_rms,
+                            tv_decision.ref_rms,
+                            tv_decision.expected_echo_rms,
+                            tv_decision.threshold,
+                            tv_decision.learned_ratio,
+                            tv_decision.ready,
+                        )
+                        if audio_debug_session is not None:
+                            audio_debug_session.record_event(
+                                "tv_reference_gate", {
+                                    "suppressing": tv_gate_suppressing,
+                                    "mic_rms": round(tv_decision.mic_rms, 6),
+                                    "ref_rms": round(tv_decision.ref_rms, 6),
+                                    "threshold": round(tv_decision.threshold, 6),
+                                    "learned_ratio": round(tv_decision.learned_ratio, 4),
+                                }
+                            )
                     was_active = voice_gate.active
                     if was_active and audio_debug_session is not None:
                         audio_debug_session.write_raw_mic(pcm16)
@@ -770,11 +811,16 @@ async def voice_socket(browser: WebSocket) -> None:
                     event = voice_gate.process_audio(
                         pcm16,
                         allow_stop=(
-                            local_speech_detected
-                            or time.monotonic() < local_speech_stop_grace_until
+                            (
+                                local_speech_detected
+                                or time.monotonic() < local_speech_stop_grace_until
+                            )
+                            and not tv_decision.suppress
                         ),
                     )
                     if event == "wake":
+                        tv_gate_armed = False
+                        VOICE_RUNTIME_STATE["tv_gate_armed"] = False
                         voice_gate.begin_activation_buffer()
                         # Close the transmit gate synchronously before scheduling
                         # the cue task, so no mic chunk can race through first.
@@ -828,15 +874,20 @@ async def voice_socket(browser: WebSocket) -> None:
                                 audio_debug_session.write_gemini_input(buffered)
                             forwarded_packet_count += 1
                     else:
-                        await provider.send_audio(pcm16)
+                        gemini_pcm = (
+                            b"\x00" * len(pcm16)
+                            if tv_gate_armed and tv_decision.suppress
+                            else pcm16
+                        )
+                        await provider.send_audio(gemini_pcm)
                         VOICE_RUNTIME_STATE["forwarded_gemini_chunks"] = int(
                             VOICE_RUNTIME_STATE.get("forwarded_gemini_chunks") or 0
                         ) + 1
                         VOICE_RUNTIME_STATE["forwarded_gemini_bytes"] = int(
                             VOICE_RUNTIME_STATE.get("forwarded_gemini_bytes") or 0
-                        ) + len(pcm16)
+                        ) + len(gemini_pcm)
                         if audio_debug_session is not None:
-                            audio_debug_session.write_gemini_input(pcm16)
+                            audio_debug_session.write_gemini_input(gemini_pcm)
                         forwarded_packet_count += 1
 
                     now = time.monotonic()
@@ -856,6 +907,12 @@ async def voice_socket(browser: WebSocket) -> None:
                         control = json.loads(text)
                         if control.get("type") == "local_speech_started":
                             if not voice_gate.active:
+                                continue
+                            if tv_gate_armed and tv_reference_gate.recent_tv_only():
+                                logger.info(
+                                    "session=%s ignored local_speech_started: TV reference gate active",
+                                    session_id,
+                                )
                                 continue
                             local_speech_detected = True
                             local_speech_stop_grace_until = 0.0
@@ -916,7 +973,7 @@ async def voice_socket(browser: WebSocket) -> None:
         speech_active.clear()
 
     async def provider_to_browser() -> None:
-        nonlocal speech_clear_task, assistant_response_active, semantic_close_pending, audio_debug_session
+        nonlocal speech_clear_task, assistant_response_active, semantic_close_pending, audio_debug_session, tv_gate_armed
         forward_audio = False
         try:
             async for event in provider.events():
@@ -930,6 +987,12 @@ async def voice_socket(browser: WebSocket) -> None:
                             audio_debug_session.write_assistant_sent(pcm_out)
                 elif event.type == "speech_started":
                     if not voice_gate.active:
+                        continue
+                    if tv_gate_armed and tv_reference_gate.recent_tv_only():
+                        logger.info(
+                            "session=%s ignored provider speech_started: probable TV-only input",
+                            session_id,
+                        )
                         continue
                     voice_gate.note_activity()
                     if speech_clear_task is not None:
@@ -1003,6 +1066,8 @@ async def voice_socket(browser: WebSocket) -> None:
                     if not (voice_gate.active or semantic_close_pending):
                         forward_audio = False
                         continue
+                    tv_gate_armed = True
+                    VOICE_RUNTIME_STATE["tv_gate_armed"] = True
                     assistant_response_active = True
                     VOICE_RUNTIME_STATE["assistant_response_active"] = True
                     if voice_gate.active:

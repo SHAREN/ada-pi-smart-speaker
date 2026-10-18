@@ -1,6 +1,7 @@
 [Unit]
 Description=ADA Pi P610 PipeWire echo cancellation
-After=pipewire-pulse.service wireplumber.service
+After=pipewire-pulse.service wireplumber.service ada-tv-aec.service
+Wants=ada-tv-aec.service
 BindsTo=pipewire-pulse.service
 PartOf=pipewire-pulse.service
 

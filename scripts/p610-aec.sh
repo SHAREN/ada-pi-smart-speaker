@@ -10,12 +10,11 @@ find_existing_module() {
 
 unload_existing() {
   local module_id=""
-  if [[ -f "$MODULE_FILE" ]]; then
-    module_id="$(cat "$MODULE_FILE" 2>/dev/null || true)"
-  fi
-  if [[ -z "$module_id" ]]; then
-    module_id="$(find_existing_module || true)"
-  fi
+  # Module IDs are recycled after a PipeWire restart. Never trust the cached
+  # numeric ID by itself: a stale value can point at an unrelated echo-cancel
+  # module (for example the TV/HDMI AEC). Identify ADA's P610 module by its
+  # stable source_name instead.
+  module_id="$(find_existing_module || true)"
   if [[ -n "$module_id" ]]; then
     pactl unload-module "$module_id" 2>/dev/null || true
   fi
@@ -41,13 +40,29 @@ case "${1:-start}" in
       exit 1
     fi
 
+    # The optional TV-AEC service starts in parallel with the P610 service.
+    # Give it a short window to publish ada_tv_aec_source so the self-AEC can
+    # reliably cascade on clean boot. If it is unavailable, fall back safely
+    # to the physical P610 microphone.
+    TV_AEC_SOURCE=""
+    for _ in $(seq 1 15); do
+      TV_AEC_SOURCE="$(pactl list short sources 2>/dev/null | awk '$2 == "ada_tv_aec_source" {print $2; exit}')"
+      [[ -n "$TV_AEC_SOURCE" ]] && break
+      sleep 0.2
+    done
+
     unload_existing
+
+    # If the optional TV/HDMI reference AEC is present, cascade it first:
+    # physical P610 mic -> TV AEC -> P610 self-echo AEC -> ADA.
+    # Otherwise keep the original single-stage P610 path.
+    CAPTURE_SOURCE="${TV_AEC_SOURCE:-$P610_SOURCE}"
 
     # Do not change the user's normal system playback device here. ADA is
     # pinned separately to ada_aec_sink, while the AEC render master is P610.
     MODULE_ID="$(pactl load-module module-echo-cancel \
       aec_method=webrtc \
-      source_master="$P610_SOURCE" \
+      source_master="$CAPTURE_SOURCE" \
       sink_master="$P610_SINK" \
       source_name=ada_aec_source \
       sink_name=ada_aec_sink \
