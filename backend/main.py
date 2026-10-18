@@ -12,6 +12,7 @@ import signal
 import time
 import uuid
 from contextlib import suppress
+from collections import deque
 from pathlib import Path
 
 from PIL import Image
@@ -759,6 +760,8 @@ async def voice_socket(browser: WebSocket) -> None:
         forwarded_packet_count = 0
         last_audio_log = time.monotonic()
         tv_gate_suppressing = False
+        tv_delay_buffer: deque[tuple[bytes, bool]] = deque()
+        tv_delay_bytes = 0
         try:
             while True:
                 message = await browser.receive()
@@ -781,26 +784,58 @@ async def voice_socket(browser: WebSocket) -> None:
                         )
                     if tv_decision.suppress != tv_gate_suppressing:
                         tv_gate_suppressing = tv_decision.suppress
+                        match_score = (
+                            tv_decision.match_score
+                            if tv_decision.match_score is not None
+                            else -1.0
+                        )
                         logger.info(
-                            "session=%s TV reference gate %s mic=%.5f ref=%.5f "
-                            "expected=%.5f threshold=%.5f ratio=%.3f ready=%s",
+                            "session=%s TV content gate %s mic=%.5f physical=%.5f "
+                            "ref=%.5f match=%.3f trigger=%.3f delay=%.0fms ready=%s",
                             session_id,
                             "suppressing" if tv_gate_suppressing else "open",
                             tv_decision.mic_rms,
+                            tv_decision.physical_rms,
                             tv_decision.ref_rms,
-                            tv_decision.expected_echo_rms,
-                            tv_decision.threshold,
-                            tv_decision.learned_ratio,
+                            match_score,
+                            tv_decision.match_threshold,
+                            tv_decision.match_delay_ms,
                             tv_decision.ready,
                         )
+                        if not tv_gate_suppressing and tv_decision.near_end_hold:
+                            # The content matcher is an independent near-end VAD.
+                            # Promote its decision immediately so local Stop and
+                            # activity tracking do not depend on the browser's
+                            # amplitude-only VAD having fired earlier.
+                            local_speech_detected = True
+                            local_speech_stop_grace_until = 0.0
+                            voice_gate.note_activity()
+                            if speech_clear_task is not None:
+                                speech_clear_task.cancel()
+                                speech_clear_task = None
+                            speech_active.set()
+                        elif tv_gate_suppressing and local_speech_detected:
+                            local_speech_detected = False
+                            local_speech_stop_grace_until = time.monotonic() + 1.0
+                            if speech_clear_task is not None:
+                                speech_clear_task.cancel()
+                            speech_clear_task = asyncio.create_task(
+                                clear_speech_activity_after_grace()
+                            )
                         if audio_debug_session is not None:
                             audio_debug_session.record_event(
                                 "tv_reference_gate", {
                                     "suppressing": tv_gate_suppressing,
                                     "mic_rms": round(tv_decision.mic_rms, 6),
+                                    "physical_rms": round(tv_decision.physical_rms, 6),
                                     "ref_rms": round(tv_decision.ref_rms, 6),
-                                    "threshold": round(tv_decision.threshold, 6),
-                                    "learned_ratio": round(tv_decision.learned_ratio, 4),
+                                    "match_score": (
+                                        round(tv_decision.match_score, 4)
+                                        if tv_decision.match_score is not None else None
+                                    ),
+                                    "match_threshold": round(tv_decision.match_threshold, 4),
+                                    "match_delay_ms": round(tv_decision.match_delay_ms, 1),
+                                    "near_end_hold": tv_decision.near_end_hold,
                                 }
                             )
                     was_active = voice_gate.active
@@ -821,6 +856,8 @@ async def voice_socket(browser: WebSocket) -> None:
                     if event == "wake":
                         tv_gate_armed = False
                         VOICE_RUNTIME_STATE["tv_gate_armed"] = False
+                        tv_delay_buffer.clear()
+                        tv_delay_bytes = 0
                         voice_gate.begin_activation_buffer()
                         # Close the transmit gate synchronously before scheduling
                         # the cue task, so no mic chunk can race through first.
@@ -874,21 +911,42 @@ async def voice_socket(browser: WebSocket) -> None:
                                 audio_debug_session.write_gemini_input(buffered)
                             forwarded_packet_count += 1
                     else:
-                        gemini_pcm = (
-                            b"\x00" * len(pcm16)
-                            if tv_gate_armed and tv_decision.suppress
-                            else pcm16
-                        )
-                        await provider.send_audio(gemini_pcm)
-                        VOICE_RUNTIME_STATE["forwarded_gemini_chunks"] = int(
-                            VOICE_RUNTIME_STATE.get("forwarded_gemini_chunks") or 0
-                        ) + 1
-                        VOICE_RUNTIME_STATE["forwarded_gemini_bytes"] = int(
-                            VOICE_RUNTIME_STATE.get("forwarded_gemini_bytes") or 0
-                        ) + len(gemini_pcm)
-                        if audio_debug_session is not None:
-                            audio_debug_session.write_gemini_input(gemini_pcm)
-                        forwarded_packet_count += 1
+                        if tv_gate_armed:
+                            # Delay only post-first-response audio.  A low content-match
+                            # score can therefore retroactively open the queued pre-roll,
+                            # preserving the beginning of a real near-end utterance.
+                            if not tv_decision.suppress and tv_delay_buffer:
+                                tv_delay_buffer = deque(
+                                    (buffered, True) for buffered, _ in tv_delay_buffer
+                                )
+                            tv_delay_buffer.append((pcm16, not tv_decision.suppress))
+                            tv_delay_bytes += len(pcm16)
+                            outgoing: list[bytes] = []
+                            while (
+                                tv_delay_buffer
+                                and tv_delay_bytes > tv_reference_gate.decision_delay_bytes
+                            ):
+                                delayed_pcm, pass_audio = tv_delay_buffer.popleft()
+                                tv_delay_bytes -= len(delayed_pcm)
+                                outgoing.append(
+                                    delayed_pcm if pass_audio else b"\x00" * len(delayed_pcm)
+                                )
+                        else:
+                            tv_delay_buffer.clear()
+                            tv_delay_bytes = 0
+                            outgoing = [pcm16]
+
+                        for gemini_pcm in outgoing:
+                            await provider.send_audio(gemini_pcm)
+                            VOICE_RUNTIME_STATE["forwarded_gemini_chunks"] = int(
+                                VOICE_RUNTIME_STATE.get("forwarded_gemini_chunks") or 0
+                            ) + 1
+                            VOICE_RUNTIME_STATE["forwarded_gemini_bytes"] = int(
+                                VOICE_RUNTIME_STATE.get("forwarded_gemini_bytes") or 0
+                            ) + len(gemini_pcm)
+                            if audio_debug_session is not None:
+                                audio_debug_session.write_gemini_input(gemini_pcm)
+                            forwarded_packet_count += 1
 
                     now = time.monotonic()
                     if now - last_audio_log >= 5:

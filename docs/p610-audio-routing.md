@@ -98,26 +98,28 @@ The live capture chain is:
 
 The TV layer uses WebRTC `extended_filter` and `delay_agnostic` processing. Tests with explicit fixed HDMI delays, mono conversion, and a virtual render sink did not consistently beat monitor mode, so the production path leaves delay estimation adaptive.
 
-### Reference-aware anti-barge-in gate
+### Real-video content-matched anti-barge-in gate
 
-AEC alone does not perfectly remove distant TV speech. The important observed failure mode was not false wake-up in standby; it was residual TV dialogue being transcribed as new user speech during an ADA response, causing Gemini to interrupt itself.
+AEC alone does not remove enough distant TV dialogue. A 29.9-second capture of the actual video playing through HDMI measured only about **2.16 dB** attenuation in the TV-AEC stage and **2.78 dB** across the complete two-stage AEC path. That is not enough to prevent intelligible actor dialogue from being detected as a user turn, so the production gate no longer decides from residual loudness and no longer needs pink-noise calibration.
 
-`backend/tv_reference_gate.py` adds a conservative second defense:
+`backend/tv_reference_gate.py` adds a content-based second defense:
 
-- `parec @DEFAULT_MONITOR@` samples the exact system render reference at 16 kHz without changing playback routing.
-- While ADA is in standby, the gate learns a robust ratio between the delayed HDMI reference and the final post-AEC microphone residual. The current calibrated reference delay is 255 ms.
-- The first user turn after `Okay Nabu` is never gated. When ADA starts the first reply, the reference gate becomes armed for the remainder of that active voice session, covering both ADA playback and the pauses between turns where TV dialogue previously created fake user messages.
-- A frame consistent with the learned TV residual is replaced with equal-duration silence before being sent to Gemini. This preserves realtime timing while preventing TV dialogue from opening Gemini's speech detector.
-- A clear near-end rise opens the gate and holds it open for 0.9 s so a user's quieter syllables are not chopped. The minimum near-end threshold is intentionally conservative (`0.006` normalized RMS) and can be overridden with environment variables.
-- Provider/local `speech_started` and local Stop authorization also ignore frames currently classified as probable TV-only input.
+- Two independent `parec` readers run at 16 kHz: one samples the exact HDMI/default-sink monitor and the other samples the **physical P610 microphone before software AEC**.
+- Every 20 ms both streams are reduced to 12 coarse log-power frequency bands. Over a rolling 500 ms window, the gate compares the temporal pattern of those bands. Per-band normalization largely removes static speaker, room and microphone coloration.
+- The matcher searches a small delay range around the current HDMI-to-P610 delay. Standby periods containing real TV playback continuously teach both the useful match-score distribution and the effective realtime delay. The delay seen by live `parec` streams can differ from an offline WAV correlation because the capture streams have their own buffering; this is why it is learned from the real running video instead of hard-coded from a pink-noise measurement.
+- A **high content-match score** means the physical microphone is hearing the same content that HDMI just played, even if an actor suddenly becomes loud. That remains TV-only and is suppressed.
+- A **low content-match score plus meaningful energy on the final post-AEC mic** is treated as independent near-end speech. The gate then stays open for 1.0 s so quieter syllables in the same utterance are not chopped.
+- The first user turn after `Okay Nabu` is never gated or delayed. When ADA begins its first response, the content gate becomes armed for the remainder of that active voice session, including the pauses between turns where TV dialogue previously created fake user messages.
+- Once armed, mic delivery to Gemini has a roughly 400 ms decision/pre-roll buffer. If an independent near-end syllable is detected, the queued original audio is released instead of losing the start of the phrase. TV-matched queued audio is replaced with equal-duration silence, preserving the realtime clock.
+- Provider/local `speech_started` and local Stop authorization also respect the content-match verdict, so loud TV dialogue cannot authorize a false interruption merely by crossing an amplitude threshold.
 
-On the retained real TV-only capture, the calibrated gate would reject about 92% of 43 ms TV-only frames at the conservative `0.006` threshold. A separate real user-speech capture contains large peaks well above the threshold; the 0.9 s hold preserves the rest of the utterance after the first near-end rise.
+On the retained real-video capture, the 500 ms physical-P610/HDMI content score had a TV-only median of about `0.583`, 10th percentile `0.461`, and minimum `0.327`. In an offline double-talk check made from that **same real TV recording** plus a retained real user-voice recording, strong near-end syllables drove the score far lower (for example around `0.14` at equal nominal level and around `0.07` at +6 dB). Production does not use those fixed numbers directly: it learns a conservative threshold from the current real TV content while in standby.
 
 ### Calibration findings
 
-- The HDMI-to-P610 acoustic delay is large. In one continuous controlled run it stayed very stable around 254.5–255.4 ms across consecutive two-second windows.
-- A frozen room FIR did not generalize well to later samples even though the delay stayed stable. The P610 itself appears to adapt its microphone gain/noise processing over time, so a one-time fixed impulse response is not a reliable production canceller.
-- A custom streaming FDAF improved recorded TV leakage by roughly 3–4 dB in conservative 16 kHz simulations; the best observed native WebRTC live run was better, so the custom filter was not put into production.
+- On the current real-video capture, offline HDMI-to-P610 correlation was about 283 ms. Live capture timing can differ, so the content matcher searches and slowly adapts the effective delay from strong TV-only matches.
+- A frozen room FIR did not generalize well even when delay was stable; P610/TV processing changes the effective transfer function enough that one static impulse response is not reliable.
+- Speaker verification was evaluated as an alternative but rejected for gating: quiet physical/post-AEC TV fragments could overlap the user's speaker-embedding similarity. Content identity against the exact HDMI reference provided a safer discriminator for this installation.
 - P610 exposes two capture channels but they were measured as bit-identical (`corr = 1.0`), so there is no independent microphone pair available for beamforming.
 
 ### Recovery and verification
