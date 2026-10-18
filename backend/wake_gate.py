@@ -42,12 +42,14 @@ class WakeSessionGate:
 
         # Production values copied from proxy39.
         self.wake_threshold = _env_float("ADA_WAKE_THRESHOLD", 0.85, 0.0, 1.0)
-        self.stop_threshold = _env_float("ADA_STOP_THRESHOLD", 0.65, 0.0, 1.0)
+        self.stop_threshold = _env_float("ADA_STOP_THRESHOLD", 0.50, 0.0, 1.0)
         self.refractory_seconds = _env_float("ADA_WAKE_REFRACTORY_SECONDS", 2.0, 0.0, 30.0)
-        self.stop_guard_seconds = _env_float("ADA_STOP_GUARD_SECONDS", 0.5, 0.0, 5.0)
+        self.stop_guard_seconds = _env_float("ADA_STOP_GUARD_SECONDS", 0.25, 0.0, 5.0)
         self.end_cue_wake_guard_seconds = _env_float("ADA_END_CUE_WAKE_GUARD_SECONDS", 1.0, 0.0, 5.0)
         self.pre_roll_seconds = _env_float("ADA_AUDIO_PREROLL_SECONDS", 2.0, 0.0, 5.0)
-        self.command_overlap_seconds = _env_float("ADA_COMMAND_OVERLAP_SECONDS", 0.4, 0.0, 1.0)
+        # Wake is an arming command, never user content. Do not forward any
+        # pre-wake overlap to Gemini after the activation cue.
+        self.command_overlap_seconds = 0.0
         self.activation_buffer_max_seconds = _env_float("ADA_ACTIVATION_BUFFER_MAX_SECONDS", 30.0, 2.0, 60.0)
         self.idle_timeout_seconds = _env_float("ADA_ACTIVE_IDLE_TIMEOUT", 30.0, 5.0, 300.0)
 
@@ -113,16 +115,15 @@ class WakeSessionGate:
             self._pre_roll_duration -= self.frame_duration(dropped)
 
     def begin_activation_buffer(self) -> None:
-        """Seed pending audio with only the short overlap around wake detection."""
-        selected: deque[bytes] = deque()
-        duration = 0.0
-        for frame in reversed(self._pre_roll):
-            selected.appendleft(frame)
-            duration += self.frame_duration(frame)
-            if duration >= self.command_overlap_seconds:
-                break
-        self._pending = selected
-        self._pending_duration = duration
+        """Start a clean post-wake command buffer.
+
+        The wake phrase itself is only an arming command.  Never seed Gemini's
+        input with standby/pre-wake audio, otherwise the tail of "Okay Nabu" or
+        the activation cue can be interpreted as a user turn and make ADA speak
+        before the user has asked anything.
+        """
+        self._pending.clear()
+        self._pending_duration = 0.0
         self._pre_roll.clear()
         self._pre_roll_duration = 0.0
         self.activation_buffer_overflow = False

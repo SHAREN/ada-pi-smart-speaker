@@ -54,6 +54,8 @@ Therefore the invariant is:
 
 - The P610 is the USB microphone/speaker front end; the assistant logic, wake word, session control, Gemini/Home Assistant integration and recovery logic live in software on the Raspberry Pi.
 - The microphone is kept available locally for wake/stop handling; the normal wake phrase is **Okay Nabu**, with local **Stop** handling.
+- Wake semantics are strict: **Okay Nabu -> play the activation cue -> start listening**. The wake phrase, standby pre-roll and audio captured while the cue is playing are never forwarded to Gemini as user content, so wake alone must not make ADA answer first.
+- **Stop** is a dedicated local microWakeWord detector on the post-AEC microphone path. Production uses the model's `0.50` cutoff and a short `0.25 s` post-cue guard; Stop is not gated by the browser amplitude VAD or the TV-content matcher because those layers can reject a quiet but valid near-end Stop.
 - The voice loop is designed for full-duplex interaction and barge-in, so echo cancellation and correct speaker reference routing are essential.
 - Do not enable Chromium/browser AEC on top of the system AEC path. `ada_aec_source` already uses `ada_aec_sink` as the render reference.
 - Earlier debugging showed that very low P610 hardware volume could make replies effectively inaudible even when playback was active. The production script therefore keeps the physical P610 output at 80%.

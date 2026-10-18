@@ -675,6 +675,10 @@ async def voice_socket(browser: WebSocket) -> None:
         finally:
             if audio_debug_session is not None:
                 audio_debug_session.record_event("wake_cue_finished", {})
+            # The wake phrase and everything heard while the activation cue is
+            # playing are control audio, not a Gemini user turn. Start listening
+            # from a clean boundary only after the cue has finished.
+            voice_gate.clear_activation_buffer()
             voice_gate.reset_after_wake_cue()
             activation_cue_done.set()
             await send_session_state()
@@ -845,13 +849,12 @@ async def voice_socket(browser: WebSocket) -> None:
                         voice_gate.remember_pre_roll(pcm16)
                     event = voice_gate.process_audio(
                         pcm16,
-                        allow_stop=(
-                            (
-                                local_speech_detected
-                                or time.monotonic() < local_speech_stop_grace_until
-                            )
-                            and not tv_decision.suppress
-                        ),
+                        # Stop is a dedicated local wake-word classifier and must
+                        # not depend on the browser amplitude VAD or TV matcher:
+                        # those gates can legitimately reject a quiet near-end
+                        # "Stop". Keep it disabled only while the wake cue itself
+                        # is playing to avoid a cue-tail false positive.
+                        allow_stop=activation_cue_done.is_set(),
                     )
                     if event == "wake":
                         tv_gate_armed = False
@@ -888,7 +891,13 @@ async def voice_socket(browser: WebSocket) -> None:
                         continue
 
                     provider_ready = bool(live_manager.snapshot()["connected"])
-                    if not activation_cue_done.is_set() or not provider_ready:
+                    if not activation_cue_done.is_set():
+                        # Deliberately discard everything heard during the wake
+                        # cue. The user asked for: wake -> cue -> listen.
+                        continue
+                    if not provider_ready:
+                        # Once listening has actually started, keep the earliest
+                        # command audio if Gemini reconnects briefly.
                         voice_gate.buffer_activation_frame(pcm16)
                         continue
 

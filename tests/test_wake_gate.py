@@ -18,25 +18,22 @@ class WakeSessionGateTests(unittest.TestCase):
         gate = WakeSessionGate(ROOT)
         self.assertEqual(gate.state, "standby")
         self.assertEqual(gate.wake_threshold, 0.85)
-        self.assertEqual(gate.stop_threshold, 0.65)
+        self.assertEqual(gate.stop_threshold, 0.50)
         self.assertEqual(gate.refractory_seconds, 2.0)
-        self.assertEqual(gate.stop_guard_seconds, 0.5)
+        self.assertEqual(gate.stop_guard_seconds, 0.25)
         self.assertEqual(gate.pre_roll_seconds, 2.0)
-        self.assertEqual(gate.command_overlap_seconds, 0.4)
+        self.assertEqual(gate.command_overlap_seconds, 0.0)
         self.assertEqual(gate.idle_timeout_seconds, 30.0)
 
-    def test_activation_buffer_uses_only_trailing_overlap(self) -> None:
+    def test_activation_buffer_discards_all_pre_wake_audio(self) -> None:
         # 320 bytes at 16 kHz mono s16 == 10 ms.
         frame = b"\x00\x00" * 160
         for _ in range(100):
             self.gate.remember_pre_roll(frame)
         self.gate.activate()
         self.gate.begin_activation_buffer()
-        pending = self.gate.activation_buffer_snapshot()
-        duration = sum(self.gate.frame_duration(item) for item in pending)
-        self.assertGreaterEqual(duration, 0.4)
-        self.assertLess(duration, 0.42)
-        self.assertLess(duration, self.gate.pre_roll_seconds)
+        self.assertEqual(self.gate.activation_buffer_snapshot(), [])
+        self.assertEqual(self.gate.status()["buffered_input_seconds"], 0.0)
 
     def test_end_lifecycle_is_closing_then_standby(self) -> None:
         self.gate.activate()
