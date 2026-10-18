@@ -135,3 +135,9 @@ curl -s http://127.0.0.1:18765/api/voice/status
 ```
 
 The expected invariant remains: **system audio -> user-selected output (normally HDMI); TV reference -> TV-AEC only; ADA playback -> P610; final ADA microphone -> TV-AEC -> P610-self AEC -> Gemini.**
+
+### Voice-only Chromium on Wayland/labwc
+
+The always-on voice browser still needs a real Chromium page for microphone/WebRTC audio, but it must not appear as a normal desktop window or steal focus. On Raspberry Pi OS the compositor is `labwc` (Wayland), so the old X11 trick of `--window-position=-32000,-32000` is not sufficient: the compositor may ignore that position and leave a tiny decorated window on-screen.
+
+`start.sh` therefore assigns the voice-only browser a dedicated native Wayland application identifier with `--class=ada-pi-voice`. The local `~/.config/labwc/rc.xml` should match `identifier="ada-pi-voice"` on first map and apply `skipTaskbar="yes"`, `skipWindowSwitcher="yes"`, `ignoreFocusRequest="yes"`, `serverDecoration="no"`, plus an `Iconify` action. Matching by `identifier` is intentional: matching only the page title is racy because Chromium can set `ADA Pi` after the toplevel has already been mapped.

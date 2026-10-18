@@ -165,6 +165,7 @@ CHROMIUM_ARGS=(
 if [[ "$UI_MODE" == "voice-only" ]]; then
   CHROMIUM_ARGS+=(
     --app="$KIOSK_URL"
+    --class=ada-pi-voice
     --start-minimized
     --window-size=1,1
     --window-position=-32000,-32000
