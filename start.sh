@@ -116,15 +116,20 @@ ADA_VIDEO_MODE="$VIDEO_MODE" "$VENV_PYTHON" -m uvicorn backend.main:app \
   --env-file "$ENV_FILE" &
 SERVER_PID=$!
 BROWSER_PID=""
+WINDOW_GUARD_PID=""
 
 cleanup() {
   trap - EXIT INT TERM
+  if [[ -n "$WINDOW_GUARD_PID" ]] && kill -0 "$WINDOW_GUARD_PID" 2>/dev/null; then
+    kill "$WINDOW_GUARD_PID" 2>/dev/null || true
+  fi
   if [[ -n "$BROWSER_PID" ]] && kill -0 "$BROWSER_PID" 2>/dev/null; then
     kill "$BROWSER_PID" 2>/dev/null || true
   fi
   if kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
   fi
+  [[ -z "$WINDOW_GUARD_PID" ]] || wait "$WINDOW_GUARD_PID" 2>/dev/null || true
   [[ -z "$BROWSER_PID" ]] || wait "$BROWSER_PID" 2>/dev/null || true
   wait "$SERVER_PID" 2>/dev/null || true
 }
@@ -166,6 +171,7 @@ if [[ "$UI_MODE" == "voice-only" ]]; then
   CHROMIUM_ARGS+=(
     --app="$KIOSK_URL"
     --class=ada-pi-voice
+    --ozone-platform=x11
     --start-minimized
     --window-size=1,1
     --window-position=-32000,-32000
@@ -176,6 +182,37 @@ fi
 
 "$CHROMIUM_BIN" "${CHROMIUM_ARGS[@]}" &
 BROWSER_PID=$!
+
+# labwc 0.8.x can still map/focus Chromium's tiny app window even when the
+# voice-only launch asks to start minimized.  For the XWayland voice window we
+# therefore enforce the hidden state directly.  xprop --spy is event-driven: if
+# Chromium later removes _NET_WM_STATE_HIDDEN while requesting activation, the
+# window is immediately hidden again without a polling loop.
+if [[ "$UI_MODE" == "voice-only" ]] && command -v wmctrl >/dev/null 2>&1 && command -v xprop >/dev/null 2>&1; then
+  (
+    export DISPLAY="${DISPLAY:-:0}"
+    export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+
+    WINDOW_ID=""
+    for _ in {1..100}; do
+      WINDOW_ID="$(wmctrl -lx 2>/dev/null | awk '$3 ~ /(^|\.)ada-pi-voice$/ {print $1; exit}')"
+      [[ -n "$WINDOW_ID" ]] && break
+      kill -0 "$BROWSER_PID" 2>/dev/null || exit 0
+      sleep 0.05
+    done
+
+    if [[ -n "$WINDOW_ID" ]]; then
+      hide_voice_window() {
+        wmctrl -ir "$WINDOW_ID" -b add,hidden,skip_taskbar,skip_pager,below >/dev/null 2>&1 || true
+      }
+      hide_voice_window
+      while kill -0 "$BROWSER_PID" 2>/dev/null && IFS= read -r _; do
+        hide_voice_window
+      done < <(xprop -spy -id "$WINDOW_ID" _NET_WM_STATE 2>/dev/null)
+    fi
+  ) &
+  WINDOW_GUARD_PID=$!
+fi
 
 # Closing either side closes the other. This also handles the on-screen Exit
 # button, which asks the backend to stop and lets this supervisor close Chromium.

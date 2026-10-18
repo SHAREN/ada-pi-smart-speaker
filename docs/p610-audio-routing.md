@@ -136,8 +136,10 @@ curl -s http://127.0.0.1:18765/api/voice/status
 
 The expected invariant remains: **system audio -> user-selected output (normally HDMI); TV reference -> TV-AEC only; ADA playback -> P610; final ADA microphone -> TV-AEC -> P610-self AEC -> Gemini.**
 
-### Voice-only Chromium on Wayland/labwc
+### Voice-only Chromium window isolation
 
-The always-on voice browser still needs a real Chromium page for microphone/WebRTC audio, but it must not appear as a normal desktop window or steal focus. On Raspberry Pi OS the compositor is `labwc` (Wayland), so the old X11 trick of `--window-position=-32000,-32000` is not sufficient: the compositor may ignore that position and leave a tiny decorated window on-screen.
+The always-on voice browser still needs a real Chromium page for microphone/WebRTC audio, but it must not appear as a normal desktop window or steal focus. Native Wayland/labwc did not reliably honor Chromium's `--start-minimized`, `--window-size=1,1`, or off-screen position, and the tiny app window could later become focused again.
 
-`start.sh` therefore assigns the voice-only browser a dedicated native Wayland application identifier with `--class=ada-pi-voice`. The local `~/.config/labwc/rc.xml` should match `identifier="ada-pi-voice"` on first map and apply `skipTaskbar="yes"`, `skipWindowSwitcher="yes"`, `ignoreFocusRequest="yes"`, `serverDecoration="no"`, plus an `Iconify` action. Matching by `identifier` is intentional: matching only the page title is racy because Chromium can set `ADA Pi` after the toplevel has already been mapped.
+`start.sh` therefore forces only the voice-only browser onto XWayland with `--ozone-platform=x11` and gives it a stable `WM_CLASS` via `--class=ada-pi-voice`. After launch an event-driven guard finds the top-level `ada-pi-voice` window, applies `hidden`, `skip_taskbar`, `skip_pager`, and `below`, then watches `_NET_WM_STATE` with `xprop -spy`. If Chromium ever removes the hidden state while trying to activate itself, the guard immediately restores it. The guard is tied to the browser lifetime and is cleaned up by the normal `start.sh` shutdown path.
+
+The local `~/.config/labwc/rc.xml` also keeps matching fallback rules, but they are no longer relied on for correctness. This was validated by manually removing `_NET_WM_STATE_HIDDEN` from the live ADA window; the guard restored `HIDDEN` automatically while the browser websocket and Gemini Live session stayed connected.
