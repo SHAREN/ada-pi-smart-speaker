@@ -110,7 +110,17 @@ else
 fi
 
 cd "$PROJECT_DIR"
-ADA_VIDEO_MODE="$VIDEO_MODE" "$VENV_PYTHON" -m uvicorn backend.main:app \
+# TV/HDMI matcher is intentionally fully disabled.  Keep the microphone path
+# independent from HDMI: no suppression, passive observer, activity guard, or
+# wake guard, and therefore no TV reference/physical parec reader processes.
+ADA_VIDEO_MODE="$VIDEO_MODE" \
+ADA_TV_SUPPRESSION_ENABLED=false \
+ADA_TV_REFERENCE_GATE=false \
+ADA_TV_REFERENCE_OBSERVE=false \
+ADA_TV_ACTIVITY_GUARD=false \
+ADA_TV_WAKE_GUARD=false \
+ADA_SEMANTIC_END_GUARD=true \
+"$VENV_PYTHON" -m uvicorn backend.main:app \
   --host "$HOST" \
   --port "$PORT" \
   --env-file "$ENV_FILE" &

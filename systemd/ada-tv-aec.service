@@ -6,6 +6,7 @@ Requires=pipewire.service pipewire-pulse.service wireplumber.service
 [Service]
 Type=simple
 Environment=XDG_RUNTIME_DIR=%t
+Environment=ADA_TV_SUPPRESSION_ENABLED=false
 ExecStart=%h/ada-pi/scripts/tv-aec-native.sh
 Restart=on-failure
 RestartSec=2

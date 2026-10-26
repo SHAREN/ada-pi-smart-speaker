@@ -19,11 +19,13 @@ class WakeSessionGateTests(unittest.TestCase):
         self.assertEqual(gate.state, "standby")
         self.assertEqual(gate.wake_threshold, 0.85)
         self.assertEqual(gate.stop_threshold, 0.60)
+        self.assertEqual(gate.stop_confirm_threshold, 0.82)
         self.assertEqual(gate.refractory_seconds, 1.0)
         self.assertEqual(gate.stop_guard_seconds, 0.25)
         self.assertEqual(gate.end_cue_wake_guard_seconds, 0.35)
         self.assertEqual(gate.pre_roll_seconds, 2.0)
         self.assertEqual(gate.command_overlap_seconds, 0.0)
+        self.assertEqual(gate.first_turn_timeout_seconds, 6.0)
         self.assertEqual(gate.idle_timeout_seconds, 30.0)
 
     def test_activation_buffer_discards_all_pre_wake_audio(self) -> None:
@@ -66,6 +68,49 @@ class WakeSessionGateTests(unittest.TestCase):
         self.assertFalse(self.gate.buffer_activation_frame(frame))
         self.assertTrue(self.gate.activation_buffer_overflow)
         self.assertEqual(len(self.gate.activation_buffer_snapshot()), 2)
+
+    def test_first_turn_timeout_closes_false_wake_window_but_real_speech_disarms_it(self) -> None:
+        with patch("backend.wake_gate.time.monotonic", return_value=100.0):
+            self.gate.activate()
+        self.assertTrue(self.gate.status()["first_turn_pending"])
+        with patch("backend.wake_gate.time.monotonic", return_value=105.9):
+            self.assertFalse(self.gate.first_turn_expired())
+        with patch("backend.wake_gate.time.monotonic", return_value=106.1):
+            self.assertTrue(self.gate.first_turn_expired())
+
+        self.gate.confirm_first_turn()
+        with patch("backend.wake_gate.time.monotonic", return_value=120.0):
+            self.assertFalse(self.gate.first_turn_expired())
+        self.assertFalse(self.gate.status()["first_turn_pending"])
+
+    def test_independent_guard_can_reject_wake_without_raising_threshold(self) -> None:
+        class Features:
+            def process_streaming(self, pcm16):
+                return [object()]
+
+            def reset(self):
+                return None
+
+        class WakeModel:
+            def __init__(self):
+                self.reset_count = 0
+
+            def process_streaming_prob(self, features):
+                return 0.91
+
+            def reset(self):
+                self.reset_count += 1
+
+        self.gate._features = Features()
+        wake_model = WakeModel()
+        self.gate._wake_model = wake_model
+        event = self.gate.process_audio(b"\x00\x00" * 320, allow_wake=False)
+        self.assertEqual(event, "wake_rejected")
+        self.assertEqual(self.gate.state, "standby")
+        self.assertEqual(self.gate.wake_count, 0)
+        self.assertEqual(self.gate.wake_rejected_count, 1)
+        self.assertAlmostEqual(self.gate.last_rejected_wake_probability, 0.91)
+        self.assertEqual(wake_model.reset_count, 1)
 
 
 if __name__ == "__main__":

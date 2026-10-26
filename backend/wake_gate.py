@@ -43,6 +43,9 @@ class WakeSessionGate:
         # Production values copied from proxy39.
         self.wake_threshold = _env_float("ADA_WAKE_THRESHOLD", 0.85, 0.0, 1.0)
         self.stop_threshold = _env_float("ADA_STOP_THRESHOLD", 0.60, 0.0, 1.0)
+        self.stop_confirm_threshold = _env_float(
+            "ADA_STOP_CONFIRM_THRESHOLD", 0.82, self.stop_threshold, 1.0
+        )
         self.refractory_seconds = _env_float("ADA_WAKE_REFRACTORY_SECONDS", 1.0, 0.0, 30.0)
         self.stop_guard_seconds = _env_float("ADA_STOP_GUARD_SECONDS", 0.25, 0.0, 5.0)
         self.end_cue_wake_guard_seconds = _env_float("ADA_END_CUE_WAKE_GUARD_SECONDS", 0.35, 0.0, 5.0)
@@ -51,6 +54,7 @@ class WakeSessionGate:
         # pre-wake overlap to Gemini after the activation cue.
         self.command_overlap_seconds = 0.0
         self.activation_buffer_max_seconds = _env_float("ADA_ACTIVATION_BUFFER_MAX_SECONDS", 30.0, 2.0, 60.0)
+        self.first_turn_timeout_seconds = _env_float("ADA_FIRST_TURN_TIMEOUT_SECONDS", 6.0, 2.0, 30.0)
         self.idle_timeout_seconds = _env_float("ADA_ACTIVE_IDLE_TIMEOUT", 30.0, 5.0, 300.0)
 
         self._wake_model.probability_cutoff = self.wake_threshold
@@ -62,6 +66,8 @@ class WakeSessionGate:
         self.last_end_reason = ""
         self._last_wake_monotonic = 0.0
         self._last_activity_monotonic = 0.0
+        self._activation_started_monotonic = 0.0
+        self._first_turn_pending = False
         self._stop_guard_until = 0.0
         self._wake_guard_until = 0.0
         self._wake_detected_monotonic = 0.0
@@ -73,9 +79,13 @@ class WakeSessionGate:
         self.activation_buffer_overflow = False
 
         self.wake_count = 0
+        self.wake_rejected_count = 0
+        self.last_rejected_wake_probability = 0.0
+        self.first_turn_timeout_count = 0
         self.stop_count = 0
         self.idle_count = 0
         self.semantic_end_count = 0
+        self.last_wake_probability = 0.0
         self.last_stop_probability = 0.0
 
     @property
@@ -114,6 +124,10 @@ class WakeSessionGate:
         while self._pre_roll and self._pre_roll_duration > self.pre_roll_seconds:
             dropped = self._pre_roll.popleft()
             self._pre_roll_duration -= self.frame_duration(dropped)
+
+    def pre_roll_snapshot(self) -> tuple[list[bytes], float]:
+        """Return the standby audio immediately preceding a wake detection."""
+        return list(self._pre_roll), self._pre_roll_duration
 
     def begin_activation_buffer(self) -> None:
         """Start a clean post-wake command buffer.
@@ -162,6 +176,8 @@ class WakeSessionGate:
         self.state = "active"
         self.last_end_reason = ""
         self._last_activity_monotonic = now
+        self._activation_started_monotonic = now
+        self._first_turn_pending = True
         self._stop_guard_until = now + self.stop_guard_seconds
         self.wake_count += 1
 
@@ -173,6 +189,8 @@ class WakeSessionGate:
         self.clear_activation_buffer()
         if reason == "stop":
             self.stop_count += 1
+        elif reason == "first_turn_timeout":
+            self.first_turn_timeout_count += 1
         elif reason == "idle":
             self.idle_count += 1
         elif reason == "semantic":
@@ -181,6 +199,8 @@ class WakeSessionGate:
     def finish_standby(self) -> None:
         self.state = "standby"
         self._last_activity_monotonic = 0.0
+        self._activation_started_monotonic = 0.0
+        self._first_turn_pending = False
         self._wake_guard_until = time.monotonic() + self.end_cue_wake_guard_seconds
         self.clear_activation_buffer()
         self._reset_models()
@@ -191,6 +211,22 @@ class WakeSessionGate:
         self._wake_model.reset()
         self._stop_model.reset()
         self._stop_guard_until = time.monotonic() + self.stop_guard_seconds
+
+    def confirm_first_turn(self) -> None:
+        if self.state == "active":
+            self._first_turn_pending = False
+
+    def first_turn_wait_elapsed(self) -> float:
+        if self.state != "active" or not self._first_turn_pending or not self._activation_started_monotonic:
+            return 0.0
+        return max(0.0, time.monotonic() - self._activation_started_monotonic)
+
+    def first_turn_expired(self) -> bool:
+        return (
+            self.state == "active"
+            and self._first_turn_pending
+            and self.first_turn_wait_elapsed() >= self.first_turn_timeout_seconds
+        )
 
     def note_activity(self) -> None:
         if self.state == "active":
@@ -204,12 +240,19 @@ class WakeSessionGate:
     def idle_expired(self) -> bool:
         return self.state == "active" and self.idle_elapsed() >= self.idle_timeout_seconds
 
-    def process_audio(self, pcm16: bytes, *, allow_stop: bool = True) -> str | None:
-        """Return ``wake`` or ``stop`` on a local detection, otherwise ``None``.
+    def process_audio(
+        self,
+        pcm16: bytes,
+        *,
+        allow_stop: bool = True,
+        allow_wake: bool = True,
+        close_on_stop: bool = True,
+    ) -> str | None:
+        """Return a local wake/stop decision, otherwise ``None``.
 
-        ``allow_stop`` must come from an independent near-end/local-speech VAD.
-        The Stop model is intentionally not allowed to close a session from the
-        assistant's own speaker audio or residual echo alone.
+        ``allow_stop`` must come from independent near-end/local-speech evidence.
+        ``allow_wake`` lets an independent TV/reference matcher veto a wake-model
+        false positive without making the wake-word model itself less sensitive.
         """
         if self.state == "closing":
             return None
@@ -232,16 +275,28 @@ class WakeSessionGate:
                 if probability is None:
                     continue
                 self.last_stop_probability = float(probability)
-                if self.last_stop_probability > self.stop_threshold:
-                    self.begin_close("stop")
+                if self.last_stop_probability > self.stop_confirm_threshold:
+                    if close_on_stop:
+                        self.begin_close("stop")
+                    else:
+                        self._stop_model.reset()
                     return "stop"
                 continue
 
-            if self._wake_model.process_streaming(features):
+            probability = self._wake_model.process_streaming_prob(features)
+            if probability is None:
+                continue
+            self.last_wake_probability = float(probability)
+            if self.last_wake_probability > self.wake_threshold:
                 now = time.monotonic()
                 if now - self._last_wake_monotonic < self.refractory_seconds:
                     continue
                 self._last_wake_monotonic = now
+                if not allow_wake:
+                    self.wake_rejected_count += 1
+                    self.last_rejected_wake_probability = self.last_wake_probability
+                    self._wake_model.reset()
+                    return "wake_rejected"
                 self.activate()
                 return "wake"
         return None
@@ -255,6 +310,8 @@ class WakeSessionGate:
             "stop_word": "Stop",
             "wake_threshold": self.wake_threshold,
             "stop_threshold": self.stop_threshold,
+            "stop_confirm_threshold": self.stop_confirm_threshold,
+            "last_wake_probability": round(self.last_wake_probability, 4),
             "last_stop_probability": round(self.last_stop_probability, 4),
             "refractory_seconds": self.refractory_seconds,
             "stop_guard_seconds": self.stop_guard_seconds,
@@ -262,6 +319,9 @@ class WakeSessionGate:
             "audio_preroll_seconds": self.pre_roll_seconds,
             "command_overlap_seconds": self.command_overlap_seconds,
             "activation_buffer_max_seconds": self.activation_buffer_max_seconds,
+            "first_turn_timeout_seconds": self.first_turn_timeout_seconds,
+            "first_turn_pending": self._first_turn_pending,
+            "first_turn_wait_elapsed_seconds": round(self.first_turn_wait_elapsed(), 3),
             "active_idle_timeout_seconds": self.idle_timeout_seconds,
             "idle_elapsed_seconds": round(self.idle_elapsed(), 3),
             "buffered_input_frames": len(self._pending),
@@ -269,6 +329,9 @@ class WakeSessionGate:
             "buffered_input_seconds": round(self._pending_duration, 3),
             "activation_buffer_overflow": self.activation_buffer_overflow,
             "wake_count": self.wake_count,
+            "wake_rejected_count": self.wake_rejected_count,
+            "last_rejected_wake_probability": round(self.last_rejected_wake_probability, 4),
+            "first_turn_timeout_count": self.first_turn_timeout_count,
             "stop_count": self.stop_count,
             "idle_count": self.idle_count,
             "semantic_end_count": self.semantic_end_count,

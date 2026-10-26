@@ -13,6 +13,27 @@ from .realtime_provider import ProviderEvent, create_provider
 logger = logging.getLogger("voice.live_manager")
 
 
+def _expired_resumption_error(exc: Exception) -> bool:
+    """Return true when Gemini rejected a stale/expired Live resumption handle."""
+    message = str(exc).casefold()
+    return (
+        "session not found or expired" in message
+        or "resumption" in message and "expired" in message
+        or "resumption" in message and "not found" in message
+    )
+
+
+def _contended_resumption_error(exc: Exception) -> bool:
+    """Return true when a resumption handle is still bound to another Live socket.
+
+    Retrying the same handle can loop indefinitely with Gemini's
+    ``session is already connected to an existing client`` response.  A fresh
+    session is safer than repeatedly presenting a handle the server refuses.
+    """
+    message = str(exc).casefold()
+    return "session is already connected to an existing client" in message
+
+
 class LiveSessionManager:
     def __init__(
         self, prompt_getter: Callable[[], str],
@@ -26,8 +47,12 @@ class LiveSessionManager:
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._connected = asyncio.Event()
+        self._playback_idle = asyncio.Event()
+        self._playback_idle.set()
         self._subscribers: set[asyncio.Queue[ProviderEvent]] = set()
         self._generation = 0
+        self.playback_busy = False
+        self.playback_deferred_turn_count = 0
         self.reconnect_count = 0
         self.fresh_session_count = 0
         self.status = "stopped"
@@ -53,17 +78,20 @@ class LiveSessionManager:
             provider.session_id = "persistent"
             self.provider = provider
             self.status = "connecting"
+            drop_resumption_handle = False
             try:
                 await provider.connect(resumption_handle=handle)
                 self.status = "connected"
                 self.last_error = ""
                 self._connected.set()
+                await self._broadcast(ProviderEvent("live_connected", {"reconnect_count": self.reconnect_count}))
                 delay = 1.0
                 async for event in provider.events():
                     if provider.resumption_handle:
                         handle = provider.resumption_handle
                     if event.type == "go_away":
                         logger.info("Gemini Live GoAway received time_left=%s; resuming", event.data.get("time_left"))
+                        await self._broadcast(ProviderEvent("live_reconnecting", {"message": "go_away"}))
                         break
                     await self._broadcast(event)
             except asyncio.CancelledError:
@@ -72,10 +100,27 @@ class LiveSessionManager:
                 if self._stopping:
                     break
                 self.last_error = str(exc)
-                logger.warning("Gemini Live connection lost; reconnecting: %s", exc)
+                if _expired_resumption_error(exc) or _contended_resumption_error(exc):
+                    drop_resumption_handle = True
+                    handle = None
+                    provider.resumption_handle = None
+                    delay = 0.5
+                    if _contended_resumption_error(exc):
+                        logger.warning(
+                            "Gemini Live resumption handle is still attached to another client; "
+                            "dropping it and opening a fresh session: %s",
+                            exc,
+                        )
+                    else:
+                        logger.warning(
+                            "Gemini Live resumption handle expired; reconnecting with a fresh session: %s",
+                            exc,
+                        )
+                else:
+                    logger.warning("Gemini Live connection lost; reconnecting: %s", exc)
                 await self._broadcast(ProviderEvent("live_reconnecting", {"message": str(exc)}))
             finally:
-                if provider.resumption_handle:
+                if provider.resumption_handle and not drop_resumption_handle:
                     handle = provider.resumption_handle
                 self._connected.clear()
                 with suppress(Exception):
@@ -123,13 +168,40 @@ class LiveSessionManager:
     async def send_audio(self, pcm16: bytes) -> None:
         await (await self._ready_provider()).send_audio(pcm16)
 
+    async def send_activity_start(self) -> None:
+        await (await self._ready_provider()).send_activity_start()
+
+    async def send_activity_end(self) -> None:
+        await (await self._ready_provider()).send_activity_end()
+
+    async def interrupt_response(self) -> None:
+        await (await self._ready_provider()).interrupt_response()
+
     async def send_video(self, jpeg: bytes) -> None:
         await (await self._ready_provider()).send_video(jpeg)
 
+    def set_playback_busy(self, busy: bool) -> None:
+        """Serialize proactive turns behind physically active assistant playback."""
+        self.playback_busy = bool(busy)
+        if self.playback_busy:
+            self._playback_idle.clear()
+        else:
+            self._playback_idle.set()
+
+    async def _wait_for_playback_idle(self, source: str) -> None:
+        if self._playback_idle.is_set():
+            return
+        self.playback_deferred_turn_count += 1
+        logger.info("deferring %s until assistant playback is physically drained", source)
+        await self._playback_idle.wait()
+        logger.info("releasing deferred %s after assistant playback drained", source)
+
     async def send_text_turn(self, message: str) -> None:
+        await self._wait_for_playback_idle("text turn")
         await (await self._ready_provider()).send_text_turn(message)
 
     async def send_habit_alert(self, jpeg: bytes, alert: str) -> None:
+        await self._wait_for_playback_idle("habit alert")
         await (await self._ready_provider()).send_habit_alert(jpeg, alert)
 
     async def reload_prompt(self) -> None:
@@ -156,6 +228,8 @@ class LiveSessionManager:
             "generation": self._generation,
             "reconnect_count": self.reconnect_count,
             "fresh_session_count": self.fresh_session_count,
+            "playback_busy": self.playback_busy,
+            "playback_deferred_turn_count": self.playback_deferred_turn_count,
             "connected": self._connected.is_set(),
             "has_provider": provider is not None,
             "web_search_enabled": bool(
@@ -165,6 +239,35 @@ class LiveSessionManager:
             "ha_mcp_tool_count": int(getattr(provider, "_ha_tool_count", 0) or 0) if provider else 0,
             "web_tool_calls": int(getattr(provider, "_web_tool_calls", 0) or 0) if provider else 0,
             "ha_tool_calls": int(getattr(provider, "_ha_tool_calls", 0) or 0) if provider else 0,
+            "weather_entity": str(getattr(provider, "weather_entity", "") or "") if provider else "",
+            "weather_cached": bool(getattr(provider, "_weather_cache", None)) if provider else False,
+            "weather_captured_at": (
+                str((getattr(provider, "_weather_cache", None) or {}).get("captured_at") or "")
+                if provider else ""
+            ),
+            "weather_cache_ttl_seconds": float(
+                getattr(provider, "weather_cache_ttl_seconds", 0.0) or 0.0
+            ) if provider else 0.0,
+            "weather_condition": (
+                str((getattr(provider, "_weather_cache", None) or {}).get("condition") or "")
+                if provider else ""
+            ),
+            "weather_temperature": (
+                (getattr(provider, "_weather_cache", None) or {}).get("temperature")
+                if provider else None
+            ),
+            "weather_hourly_count": (
+                len((getattr(provider, "_weather_cache", None) or {}).get("hourly") or [])
+                if provider else 0
+            ),
+            "weather_daynight_count": (
+                len((getattr(provider, "_weather_cache", None) or {}).get("twice_daily") or [])
+                if provider else 0
+            ),
+            "weather_voice_summary": (
+                str((getattr(provider, "_weather_cache", None) or {}).get("voice_summary") or "")
+                if provider else ""
+            ),
         }
 
     async def stop(self) -> None:

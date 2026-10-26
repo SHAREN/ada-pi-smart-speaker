@@ -39,6 +39,16 @@ class ConversationMemoryTests(unittest.TestCase):
             memory.append("user", "одна фраза")
             self.assertEqual(memory.snapshot()["turn_count"], 1)
 
+    def test_single_letter_user_asr_noise_is_not_persisted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "memory.json"
+            memory = ConversationMemory(path)
+            memory.append("user", "A")
+            memory.append("user", "О")
+            memory.append("user", "Да")
+            self.assertEqual(memory.snapshot()["turn_count"], 1)
+            self.assertIn("User: Да", memory.prompt_context())
+
 
 if __name__ == "__main__":
     unittest.main()

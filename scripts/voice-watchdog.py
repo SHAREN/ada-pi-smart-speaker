@@ -3,14 +3,14 @@
 
 Checks ADA API, Chromium voice websocket state, P610/AEC PipeWire nodes and the
 Gemini provider. It repairs only the narrow layer that is safely repairable:
-AEC is restarted independently; ADA itself is restarted only after repeated API
-or browser failures. Home Assistant and unrelated services are never touched.
+AEC is rebuilt together with ADA's capture client when needed; ADA itself is
+restarted only after repeated API/browser/provider/capture failures. Home
+Assistant and unrelated services are never touched.
 """
 from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import time
 import urllib.error
@@ -26,11 +26,17 @@ XDG_RUNTIME_DIR = "/run/user/1000"
 ADA_SERVICE = "ada-pi.service"
 AEC_SERVICE = "ada-p610-aec.service"
 TV_AEC_SERVICE = "ada-tv-aec.service"
+TV_SUPPRESSION_ENABLED = os.environ.get(
+    "ADA_TV_SUPPRESSION_ENABLED", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
 FAILURE_THRESHOLD = 2
+# LiveSessionManager normally heals transient GoAway/network reconnects itself.
+# Escalate only when the provider has stayed unhealthy for several watchdog
+# periods; otherwise a bad resumption loop can leave voice offline indefinitely.
+PROVIDER_FAILURE_THRESHOLD = 4
 ADA_RESTART_COOLDOWN = 300.0
 AEC_RESTART_COOLDOWN = 120.0
 P610_SINK_FRAGMENT = "alsa_output.usb-Plantronics_Plantronics_P610_"
-AEC_PLAYBACK_NODE = 'node.name = "echo-cancel-playback"'
 
 
 def now() -> float:
@@ -61,7 +67,9 @@ def api_status() -> tuple[bool, dict[str, Any]]:
         return False, {"error": str(exc)}
 
 
-def run(command: list[str], timeout: float = 8.0) -> tuple[bool, str]:
+def run(
+    command: list[str], timeout: float = 8.0, *, stdout_only_on_success: bool = False
+) -> tuple[bool, str]:
     env = os.environ.copy()
     env["XDG_RUNTIME_DIR"] = XDG_RUNTIME_DIR
     try:
@@ -71,43 +79,82 @@ def run(command: list[str], timeout: float = 8.0) -> tuple[bool, str]:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
-    output = (result.stdout + result.stderr).strip()
-    return result.returncode == 0, output
+    ok = result.returncode == 0
+    if ok and stdout_only_on_success:
+        # Machine-readable commands such as `pactl -f json` must not have
+        # harmless stderr diagnostics appended to their structured stdout.
+        output = result.stdout.strip()
+    else:
+        output = (result.stdout + result.stderr).strip()
+    return ok, output
 
 
 def ensure_aec_playback_on_p610() -> dict[str, Any]:
-    """Keep only ADA's AEC render stream pinned to the physical P610 sink."""
-    sinks_ok, sinks = run(["pactl", "list", "short", "sinks"])
-    inputs_ok, sink_inputs = run(["pactl", "list", "sink-inputs"])
+    """Keep ADA's AEC render stream pinned to the physical P610 sink.
+
+    Use pactl JSON rather than localized human-readable output. The live sink id
+    is authoritative: target.object may still name P610 after stream-restore has
+    actually moved the stream to HDMI.
+    """
+    sinks_ok, sinks_raw = run(
+        ["pactl", "-f", "json", "list", "sinks"], stdout_only_on_success=True
+    )
+    inputs_ok, inputs_raw = run(
+        ["pactl", "-f", "json", "list", "sink-inputs"], stdout_only_on_success=True
+    )
     if not sinks_ok or not inputs_ok:
         return {"ok": False, "repaired": False, "detail": "pactl unavailable"}
 
+    try:
+        sinks = json.loads(sinks_raw)
+        sink_inputs = json.loads(inputs_raw)
+    except json.JSONDecodeError as exc:
+        return {
+            "ok": False,
+            "repaired": False,
+            "detail": f"pactl JSON parse failed: {exc}",
+        }
+
     p610_sink_id: str | None = None
-    for line in sinks.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and P610_SINK_FRAGMENT in parts[1]:
-            p610_sink_id = parts[0]
+    p610_sink_name: str | None = None
+    for sink in sinks if isinstance(sinks, list) else []:
+        name = str(sink.get("name") or "") if isinstance(sink, dict) else ""
+        if P610_SINK_FRAGMENT in name:
+            p610_sink_id = str(sink.get("index"))
+            p610_sink_name = name
             break
 
-    if not p610_sink_id:
+    if not p610_sink_id or p610_sink_id == "None":
         return {"ok": False, "repaired": False, "detail": "P610 sink not found"}
 
-    for block in re.split(r"\n\s*\n", sink_inputs):
-        if AEC_PLAYBACK_NODE not in block:
+    for item in sink_inputs if isinstance(sink_inputs, list) else []:
+        if not isinstance(item, dict):
             continue
-        input_match = re.search(r"Sink Input #(\d+)", block)
-        sink_match = re.search(r"^\s*Sink:\s*(\d+)\s*$", block, re.MULTILINE)
-        if not input_match or not sink_match:
-            return {"ok": False, "repaired": False, "detail": "AEC sink-input parse failed"}
-        input_id = input_match.group(1)
-        current_sink_id = sink_match.group(1)
+        props = item.get("properties") or {}
+        if not isinstance(props, dict):
+            continue
+        if props.get("node.name") != "echo-cancel-playback":
+            continue
+        target_object = str(props.get("target.object") or "")
+        # There can be more than one echo-cancel module. The ADA self-AEC render
+        # is the one whose declared physical target is the P610.
+        if P610_SINK_FRAGMENT not in target_object:
+            continue
+
+        input_id = str(item.get("index"))
+        current_sink_id = str(item.get("sink"))
+        if input_id == "None" or current_sink_id == "None":
+            return {"ok": False, "repaired": False, "detail": "AEC JSON route incomplete"}
         if current_sink_id == p610_sink_id:
             return {
                 "ok": True,
                 "repaired": False,
                 "sink_input_id": input_id,
                 "p610_sink_id": p610_sink_id,
+                "p610_sink_name": p610_sink_name,
+                "route": "sink-id-json",
             }
+
         ok, output = run(["pactl", "move-sink-input", input_id, p610_sink_id])
         return {
             "ok": ok,
@@ -115,10 +162,12 @@ def ensure_aec_playback_on_p610() -> dict[str, Any]:
             "sink_input_id": input_id,
             "previous_sink_id": current_sink_id,
             "p610_sink_id": p610_sink_id,
+            "p610_sink_name": p610_sink_name,
+            "target_object": target_object,
             "detail": output[-500:],
         }
 
-    return {"ok": False, "repaired": False, "detail": "AEC playback stream not found"}
+    return {"ok": False, "repaired": False, "detail": "ADA AEC playback stream not found"}
 
 
 def audio_nodes() -> dict[str, bool]:
@@ -154,7 +203,7 @@ def main() -> int:
     ha_mcp_tool_count = int(provider.get("ha_mcp_tool_count") or 0) if api_ok else 0
     smart_tools_ok = bool(web_search_ok and ha_mcp_tool_count >= 13)
     aec_ok = bool(audio["aec_source_present"] and audio["aec_sink_present"])
-    tv_aec_ok = bool(audio["tv_aec_source_present"])
+    tv_aec_ok = bool(not TV_SUPPRESSION_ENABLED or audio["tv_aec_source_present"])
     current_raw = runtime.get("raw_mic_chunks") if api_ok else None
     previous_raw = state.get("previous_raw_mic_chunks")
     mic_expected = bool(api_ok and browser_ok and audio["p610_present"] and aec_ok)
@@ -174,7 +223,10 @@ def main() -> int:
     api_failures = bump("api_failures", not api_ok)
     browser_failures = bump("browser_failures", api_ok and not browser_ok)
     aec_failures = bump("aec_failures", audio["p610_present"] and not aec_ok)
-    tv_aec_failures = bump("tv_aec_failures", audio["p610_present"] and not tv_aec_ok)
+    tv_aec_failures = bump(
+        "tv_aec_failures",
+        TV_SUPPRESSION_ENABLED and audio["p610_present"] and not tv_aec_ok,
+    )
     provider_failures = bump("provider_failures", api_ok and not provider_ok)
     mic_failures = bump("mic_failures", mic_stale)
     if isinstance(current_raw, int):
@@ -198,9 +250,8 @@ def main() -> int:
             if tv_ok:
                 p610_ok, p610_output = restart_user_service(AEC_SERVICE)
             if tv_ok and p610_ok:
-                # Recreating the capture sources invalidates Chromium's old
-                # recording stream. Reconnect ADA immediately instead of
-                # waiting for a later browser-stale watchdog cycle.
+                # Recreating capture sources invalidates Chromium's old recording
+                # stream, so rebuild the browser/backend session immediately.
                 ada_ok, ada_output = restart_user_service(ADA_SERVICE)
             state["last_tv_aec_restart_at"] = checked_at
             if tv_ok and p610_ok and ada_ok:
@@ -208,10 +259,12 @@ def main() -> int:
                 state["aec_failures"] = 0
                 state["browser_failures"] = 0
                 state["mic_failures"] = 0
+                state["provider_failures"] = 0
                 tv_aec_failures = 0
                 aec_failures = 0
                 browser_failures = 0
                 mic_failures = 0
+                provider_failures = 0
             actions.append({
                 "action": "restart_tv_aec_cascade",
                 "ok": bool(tv_ok and p610_ok and ada_ok),
@@ -222,21 +275,46 @@ def main() -> int:
                 },
             })
 
-    # P610 self-AEC has its own isolated service, so repair it independently.
+    # Recreating the P610 AEC source invalidates Chromium's current MediaStream.
+    # Therefore an AEC repair is an atomic AEC+ADA repair, not an isolated restart.
     if aec_failures >= FAILURE_THRESHOLD:
         last = float(state.get("last_aec_restart_at", 0) or 0)
         if checked_at - last >= AEC_RESTART_COOLDOWN:
-            ok, output = restart_user_service(AEC_SERVICE)
+            aec_repair_ok, aec_output = restart_user_service(AEC_SERVICE)
+            ada_repair_ok = False
+            ada_output = ""
+            if aec_repair_ok:
+                ada_repair_ok, ada_output = restart_user_service(ADA_SERVICE)
+            repair_ok = bool(aec_repair_ok and ada_repair_ok)
             state["last_aec_restart_at"] = checked_at
-            state["aec_failures"] = 0 if ok else aec_failures
-            actions.append({"action": "restart_aec", "ok": ok, "detail": output[-500:]})
+            if repair_ok:
+                state["aec_failures"] = 0
+                state["api_failures"] = 0
+                state["browser_failures"] = 0
+                state["mic_failures"] = 0
+                state["provider_failures"] = 0
+                aec_failures = 0
+                api_failures = 0
+                browser_failures = 0
+                mic_failures = 0
+                provider_failures = 0
+            actions.append({
+                "action": "restart_aec_and_ada",
+                "ok": repair_ok,
+                "detail": {
+                    "aec": aec_output[-500:],
+                    "ada": ada_output[-500:],
+                },
+            })
 
-    # ADA restart is deliberately conservative and never happens for a transient
-    # Gemini reconnect. API/browser/capture failures must repeat and respect cooldown.
+    # ADA restart is deliberately conservative for transient Live reconnects.
+    # API/browser/capture failures must repeat, while provider-only failure gets a
+    # longer grace period before this final escape hatch is used.
     ada_failed = (
         api_failures >= FAILURE_THRESHOLD
         or browser_failures >= FAILURE_THRESHOLD
         or mic_failures >= FAILURE_THRESHOLD
+        or provider_failures >= PROVIDER_FAILURE_THRESHOLD
     )
     if ada_failed:
         last = float(state.get("last_ada_restart_at", 0) or 0)
@@ -247,10 +325,9 @@ def main() -> int:
                 state["api_failures"] = 0
                 state["browser_failures"] = 0
                 state["mic_failures"] = 0
+                state["provider_failures"] = 0
             actions.append({"action": "restart_ada", "ok": ok, "detail": output[-500:]})
 
-    # A provider failure is exposed but left to LiveSessionManager's own reconnect
-    # and resumption loop; restarting ADA would be less narrow and can lose context.
     mic_ok = bool(mic_expected and not mic_stale)
     health = {
         "checked_at": checked_at,

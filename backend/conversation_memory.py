@@ -25,6 +25,13 @@ class ConversationMemory:
     def _clean(text: str) -> str:
         return " ".join(str(text).split()).strip()
 
+    @staticmethod
+    def _obvious_noise(role: str, text: str) -> bool:
+        # Single-letter ASR fragments (A/O/О/...) are common when residual
+        # speaker echo is mistaken for a user turn. They carry no useful
+        # cross-session context and must not poison the persistent prompt.
+        return role == "user" and len(text) == 1 and text.isalpha()
+
     def _load(self) -> None:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -38,7 +45,7 @@ class ConversationMemory:
                 continue
             role = str(item.get("role") or "")
             text = self._clean(str(item.get("text") or ""))
-            if role in {"user", "assistant"} and text:
+            if role in {"user", "assistant"} and text and not self._obvious_noise(role, text):
                 self._turns.append({
                     "role": role,
                     "text": text,
@@ -65,7 +72,7 @@ class ConversationMemory:
         if role not in {"user", "assistant"}:
             raise ValueError(f"unsupported conversation-memory role: {role}")
         cleaned = self._clean(text)
-        if not cleaned:
+        if not cleaned or self._obvious_noise(role, cleaned):
             return
         if self._turns and self._turns[-1]["role"] == role and self._turns[-1]["text"] == cleaned:
             return

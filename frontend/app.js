@@ -76,6 +76,17 @@ let playbackAnalyser = null;
 let playbackMeterFrame = null;
 let assistantEntry = null;
 let assistantPlaybackActive = false;
+let assistantAudioChunkSequence = 0;
+let assistantLastWsChunkAt = 0;
+let browserEventLoopLagMs = 0;
+let browserEventLoopLagPeakMs = 0;
+let browserEventLoopExpectedAt = performance.now() + 250;
+setInterval(() => {
+  const now = performance.now();
+  browserEventLoopLagMs = Math.max(0, now - browserEventLoopExpectedAt);
+  browserEventLoopLagPeakMs = Math.max(browserEventLoopLagPeakMs, browserEventLoopLagMs);
+  browserEventLoopExpectedAt = now + 250;
+}, 250);
 let localSpeechActive = false;
 let speechAboveFrames = 0;
 let speechBelowFrames = 0;
@@ -894,25 +905,99 @@ async function createPlayback() {
   const workletSource = `
     class PCMPlayer extends AudioWorkletProcessor {
       constructor() { super(); this.queue = []; this.offset = 0; this.bufferedSamples = 0;
-        this.playing = false; this.forceStart = false; this.startThreshold = 1440;
+        // Keep low latency on a healthy stream, but learn the actual WebSocket/proxy
+        // chunk gap before speaking. 24 kHz: 4320 = 180 ms, 9600 = 400 ms.
+        this.playing = false; this.forceStart = false; this.responseComplete = false;
+        this.initialThreshold = 4320; this.recoveryThreshold = 9600;
+        this.jitterSafety = 2880; // 120 ms beyond the largest observed delivery deficit.
+        this.startThreshold = this.initialThreshold;
+        this.chunksSeen = 0; this.lastChunkAt = 0; this.lastChunkSamples = 0;
+        this.maxChunkGap = 0; this.maxJitterDeficit = 0; this.underruns = 0;
+        this.emptySince = -1; this.underrunGapReported = false; this.underrunGraceSeconds = 0.12;
+        this.drainReported = false;
         this.port.onmessage = e => {
         if (e.data.type === 'clear') {
           this.queue = []; this.offset = 0; this.bufferedSamples = 0;
-          this.playing = false; this.forceStart = false;
+          this.playing = false; this.forceStart = false; this.responseComplete = false;
+          this.startThreshold = this.initialThreshold;
+          this.chunksSeen = 0; this.lastChunkAt = 0; this.lastChunkSamples = 0;
+          this.maxChunkGap = 0; this.maxJitterDeficit = 0; this.underruns = 0;
+          this.emptySince = -1; this.underrunGapReported = false; this.drainReported = false;
+        } else if (e.data.type === 'response_start') {
+          this.responseComplete = false; this.forceStart = false; this.drainReported = false;
+          this.startThreshold = this.initialThreshold;
+          this.chunksSeen = 0; this.lastChunkAt = 0; this.lastChunkSamples = 0;
+          this.maxChunkGap = 0; this.maxJitterDeficit = 0; this.underruns = 0;
+          this.emptySince = -1; this.underrunGapReported = false;
         } else if (e.data.type === 'flush') {
-          this.forceStart = true;
-        } else {
-          const chunk = new Int16Array(e.data);
+          this.responseComplete = true; this.forceStart = true;
+          this.port.postMessage({ type: 'playback_telemetry', event: 'flush',
+            buffered_ms: Math.round(this.bufferedSamples * 1000 / sampleRate),
+            threshold_ms: Math.round(this.startThreshold * 1000 / sampleRate),
+            max_chunk_gap_ms: Math.round(this.maxChunkGap * 1000 / sampleRate),
+            max_jitter_deficit_ms: Math.round(this.maxJitterDeficit * 1000 / sampleRate), underruns: this.underruns });
+          // response_completed may arrive after the final PCM sample has already
+          // left the worklet. In that zero-buffer case process() can return early
+          // before reaching its normal drain branch, so acknowledge the physical
+          // drain immediately here instead of leaving the backend speaking-lock
+          // stuck forever.
+          if (!this.queue.length && this.bufferedSamples <= 0 && !this.drainReported) {
+            this.drainReported = true;
+            this.emptySince = -1; this.underrunGapReported = false;
+            this.forceStart = false;
+            this.startThreshold = this.initialThreshold;
+            this.port.postMessage({ type: 'playback_telemetry', event: 'drained',
+              buffered_ms: 0,
+              max_chunk_gap_ms: Math.round(this.maxChunkGap * 1000 / sampleRate),
+              max_jitter_deficit_ms: Math.round(this.maxJitterDeficit * 1000 / sampleRate),
+              underruns: this.underruns });
+          }
+        } else if (e.data.type === 'audio_chunk') {
+          const chunk = new Int16Array(e.data.pcm);
+          const now = currentTime;
+          let workletGapSamples = 0;
+          let jitterDeficitSamples = 0;
+          if (this.lastChunkAt > 0) {
+            workletGapSamples = Math.round((now - this.lastChunkAt) * sampleRate);
+            jitterDeficitSamples = Math.max(0, workletGapSamples - this.lastChunkSamples);
+            this.maxChunkGap = Math.max(this.maxChunkGap, workletGapSamples);
+            this.maxJitterDeficit = Math.max(this.maxJitterDeficit, jitterDeficitSamples);
+          }
+          this.lastChunkAt = now; this.lastChunkSamples = chunk.length; this.chunksSeen++;
+          this.emptySince = -1; this.underrunGapReported = false;
+          const queueBefore = this.bufferedSamples;
           this.queue.push(chunk); this.bufferedSamples += chunk.length;
+          if (!this.playing && this.maxJitterDeficit) {
+            this.startThreshold = Math.min(sampleRate * 2,
+              Math.max(this.startThreshold, this.maxJitterDeficit + this.jitterSafety));
+          }
+          this.port.postMessage({ type: 'playback_telemetry', event: 'chunk_enqueued',
+            sequence: e.data.sequence, bytes: chunk.byteLength,
+            ws_gap_ms: e.data.ws_gap_ms,
+            main_thread_lag_ms: e.data.main_thread_lag_ms,
+            main_thread_lag_peak_ms: e.data.main_thread_lag_peak_ms,
+            worklet_gap_ms: Math.round(workletGapSamples * 1000 / sampleRate),
+            jitter_deficit_ms: Math.round(jitterDeficitSamples * 1000 / sampleRate),
+            max_jitter_deficit_ms: Math.round(this.maxJitterDeficit * 1000 / sampleRate),
+            queue_before_ms: Math.round(queueBefore * 1000 / sampleRate),
+            queue_after_ms: Math.round(this.bufferedSamples * 1000 / sampleRate),
+            threshold_ms: Math.round(this.startThreshold * 1000 / sampleRate) });
         }
       }; }
       process(inputs, outputs) {
         const out = outputs[0][0]; out.fill(0); let n = 0;
-        // Hold about 60 ms before starting or recovering from an underrun.
-        // This absorbs ordinary WebSocket jitter without delaying barge-in.
+        // Do not commit to playback after only one chunk: the second arrival tells us
+        // whether this response is healthy or bursty. Healthy streams still start fast;
+        // bursty streams build enough reserve to avoid word-pause-word playback.
         if (!this.playing) {
+          if (this.chunksSeen < 2 && !this.forceStart) return true;
           if (this.bufferedSamples < this.startThreshold && !(this.forceStart && this.bufferedSamples)) return true;
           this.playing = true;
+          this.port.postMessage({ type: 'playback_telemetry', event: 'resume',
+            buffered_ms: Math.round(this.bufferedSamples * 1000 / sampleRate),
+            threshold_ms: Math.round(this.startThreshold * 1000 / sampleRate),
+            max_chunk_gap_ms: Math.round(this.maxChunkGap * 1000 / sampleRate),
+            max_jitter_deficit_ms: Math.round(this.maxJitterDeficit * 1000 / sampleRate), underruns: this.underruns });
         }
         while (n < out.length && this.queue.length) {
           const chunk = this.queue[0];
@@ -921,7 +1006,43 @@ async function createPlayback() {
           }
           if (this.offset >= chunk.length) { this.queue.shift(); this.offset = 0; }
         }
-        if (!this.queue.length) { this.playing = false; this.forceStart = false; }
+        if (!this.queue.length) {
+          this.playing = false;
+          if (!this.responseComplete) {
+            if (this.emptySince < 0) this.emptySince = currentTime;
+            const emptyFor = Math.max(0, currentTime - this.emptySince);
+            // A response_completed control frame can arrive just after the last
+            // PCM sample. Give that normal tail a short grace period before
+            // classifying the empty queue as a transport underrun.
+            if (!this.underrunGapReported && emptyFor >= this.underrunGraceSeconds) {
+              this.underrunGapReported = true;
+              this.underruns++;
+              const learned = this.maxJitterDeficit + this.jitterSafety;
+              const escalating = this.recoveryThreshold + this.underruns * 4800;
+              this.startThreshold = Math.min(sampleRate * 2,
+                Math.max(this.recoveryThreshold, learned, escalating));
+              this.port.postMessage({ type: 'playback_telemetry', event: 'underrun',
+                queue_ms: Math.round(this.bufferedSamples * 1000 / sampleRate),
+                empty_for_ms: Math.round(emptyFor * 1000),
+                tail_grace_ms: Math.round(this.underrunGraceSeconds * 1000),
+                threshold_ms: Math.round(this.startThreshold * 1000 / sampleRate),
+                max_chunk_gap_ms: Math.round(this.maxChunkGap * 1000 / sampleRate),
+                max_jitter_deficit_ms: Math.round(this.maxJitterDeficit * 1000 / sampleRate), underruns: this.underruns });
+            }
+          } else {
+            this.emptySince = -1; this.underrunGapReported = false;
+            this.forceStart = false;
+            this.startThreshold = this.initialThreshold;
+            if (!this.drainReported) {
+              this.drainReported = true;
+              this.port.postMessage({ type: 'playback_telemetry', event: 'drained',
+                buffered_ms: 0,
+                max_chunk_gap_ms: Math.round(this.maxChunkGap * 1000 / sampleRate),
+                max_jitter_deficit_ms: Math.round(this.maxJitterDeficit * 1000 / sampleRate),
+                underruns: this.underruns });
+            }
+          }
+        }
         return true;
       }
     }
@@ -930,6 +1051,25 @@ async function createPlayback() {
   await playbackContext.audioWorklet.addModule(url);
   URL.revokeObjectURL(url);
   playbackNode = new AudioWorkletNode(playbackContext, "pcm-player", { outputChannelCount: [1] });
+  playbackNode.port.onmessage = (message) => {
+    const data = message.data;
+    if (!data || data.type !== "playback_telemetry") return;
+    const enriched = { ...data };
+    if (data.event !== "chunk_enqueued") {
+      const outputTimestamp = playbackContext?.getOutputTimestamp?.();
+      enriched.audio_context_state = playbackContext?.state;
+      enriched.context_time_ms = outputTimestamp?.contextTime == null ? null : Math.round(outputTimestamp.contextTime * 1000);
+      enriched.output_performance_time_ms = outputTimestamp?.performanceTime == null ? null : Math.round(outputTimestamp.performanceTime * 10) / 10;
+      enriched.main_thread_lag_ms = Math.round(browserEventLoopLagMs * 10) / 10;
+      enriched.main_thread_lag_peak_ms = Math.round(browserEventLoopLagPeakMs * 10) / 10;
+    }
+    if (data.event === "drained") assistantPlaybackActive = false;
+    if (data.event === "underrun") console.warn("assistant playback underrun", enriched);
+    else if (data.event !== "chunk_enqueued") console.info("assistant playback", enriched);
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "playback_telemetry", ...enriched }));
+    }
+  };
   // Passive output metering for the mouth. The worklet remains the only PCM
   // source, and the analyser neither buffers nor modifies its audio.
   playbackAnalyser = playbackContext.createAnalyser();
@@ -1067,12 +1207,27 @@ function handleControl(event) {
       break;
     case "response_started":
       assistantPlaybackActive = true;
+      assistantAudioChunkSequence = 0;
+      assistantLastWsChunkAt = 0;
+      browserEventLoopLagPeakMs = browserEventLoopLagMs;
       assistantEntry = null;
+      playbackNode?.port.postMessage({ type: "response_start" });
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          type: "playback_telemetry", event: "environment", phase: "response_started",
+          sample_rate: playbackContext?.sampleRate,
+          base_latency_ms: playbackContext?.baseLatency == null ? null : Math.round(playbackContext.baseLatency * 1000),
+          output_latency_ms: playbackContext?.outputLatency == null ? null : Math.round(playbackContext.outputLatency * 1000),
+          audio_context_state: playbackContext?.state,
+          visibility_state: document.visibilityState,
+          initial_buffer_ms: 180, recovery_buffer_ms: 400, jitter_safety_ms: 120, max_buffer_ms: 2000,
+        }));
+      }
       break;
     case "response_completed":
-      assistantPlaybackActive = false;
-      // Release a short final chunk that may be smaller than the jitter
-      // buffer's normal start threshold.
+      // Gemini has finished generating, but the AudioWorklet may still have
+      // buffered PCM. Keep playback_active=true until the worklet reports
+      // the queue is physically drained; only then may VAD reopen.
       playbackNode?.port.postMessage({ type: "flush" });
       assistantEntry = null;
       break;
@@ -1101,10 +1256,34 @@ async function connect() {
     const scheme = location.protocol === "https:" ? "wss" : "ws";
     socket = new WebSocket(`${scheme}://${location.host}/ws`);
     socket.binaryType = "arraybuffer";
-    socket.onopen = () => { connectionStatus.textContent = "Connecting to AI…"; };
+    socket.onopen = () => {
+      connectionStatus.textContent = "Connecting to AI…";
+      socket.send(JSON.stringify({
+        type: "playback_telemetry", event: "environment",
+        sample_rate: playbackContext?.sampleRate,
+        base_latency_ms: playbackContext?.baseLatency == null ? null : Math.round(playbackContext.baseLatency * 1000),
+        output_latency_ms: playbackContext?.outputLatency == null ? null : Math.round(playbackContext.outputLatency * 1000),
+        audio_context_state: playbackContext?.state,
+        visibility_state: document.visibilityState,
+        user_agent: navigator.userAgent,
+        initial_buffer_ms: 180, recovery_buffer_ms: 400, jitter_safety_ms: 120, max_buffer_ms: 2000,
+      }));
+    };
     socket.onmessage = (message) => {
-      if (typeof message.data === "string") handleControl(JSON.parse(message.data));
-      else playbackNode?.port.postMessage(message.data, [message.data]);
+      if (typeof message.data === "string") {
+        handleControl(JSON.parse(message.data));
+        return;
+      }
+      const now = performance.now();
+      const wsGapMs = assistantLastWsChunkAt ? Math.round((now - assistantLastWsChunkAt) * 10) / 10 : 0;
+      assistantLastWsChunkAt = now;
+      assistantAudioChunkSequence += 1;
+      playbackNode?.port.postMessage({
+        type: "audio_chunk", pcm: message.data,
+        sequence: assistantAudioChunkSequence, ws_gap_ms: wsGapMs,
+        main_thread_lag_ms: Math.round(browserEventLoopLagMs * 10) / 10,
+        main_thread_lag_peak_ms: Math.round(browserEventLoopLagPeakMs * 10) / 10,
+      }, [message.data]);
     };
     socket.onerror = () => logLine("System", "WebSocket error", "system");
     socket.onclose = () => disconnect(false);

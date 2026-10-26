@@ -124,15 +124,31 @@ class TVGateDecision:
     match_threshold: float = 0.0
     match_delay_ms: float = 0.0
     physical_rms: float = 0.0
+    probable_tv_only: bool = False
 
 
 class TVReferenceGate:
     """Reject HDMI-derived speech while preserving unrelated near-end speech."""
 
     def __init__(self) -> None:
-        self.enabled = os.environ.get("ADA_TV_REFERENCE_GATE", "true").strip().lower() in {
-            "1", "true", "yes", "on"
-        }
+        tv_suppression_enabled = os.environ.get(
+            "ADA_TV_SUPPRESSION_ENABLED", "true"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.enabled = tv_suppression_enabled and os.environ.get(
+            "ADA_TV_REFERENCE_GATE", "true"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        # Observation stays on even when suppression is deliberately disabled.
+        # This lets diagnostics identify TV-derived speech without changing what
+        # reaches Gemini or suppressing the user's microphone.
+        self.observer_enabled = os.environ.get(
+            "ADA_TV_REFERENCE_OBSERVE", "true"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.activity_guard_enabled = os.environ.get(
+            "ADA_TV_ACTIVITY_GUARD", "true"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.wake_guard_enabled = os.environ.get(
+            "ADA_TV_WAKE_GUARD", "true"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self.sample_rate = 16000
         self.chunk_ms = 20
         self.chunk_bytes = self.sample_rate * self.chunk_ms // 1000 * 2
@@ -147,6 +163,9 @@ class TVReferenceGate:
         )
         self.delay_search_seconds = max(
             0.02, float(os.environ.get("ADA_TV_MATCH_DELAY_SEARCH_MS", "120")) / 1000.0
+        )
+        self.fallback_max_delay_seconds = max(
+            0.20, float(os.environ.get("ADA_TV_MATCH_FALLBACK_MAX_DELAY_MS", "500")) / 1000.0
         )
         self.match_window_seconds = max(
             0.30, float(os.environ.get("ADA_TV_MATCH_WINDOW_MS", "500")) / 1000.0
@@ -178,7 +197,7 @@ class TVReferenceGate:
         self._restart_count = 0
 
     async def start(self) -> None:
-        if not self.enabled or self._reader_tasks:
+        if not self.observer_enabled or self._reader_tasks:
             return
         self._reader_tasks = {
             "reference": asyncio.create_task(
@@ -218,7 +237,7 @@ class TVReferenceGate:
     async def _reader_loop(self, kind: str, device: str, client_name: str) -> None:
         history = self._reference_features if kind == "reference" else self._physical_features
         tail = np.empty(0, dtype=np.float64)
-        while self.enabled:
+        while self.observer_enabled:
             try:
                 process = await asyncio.create_subprocess_exec(
                     "parec",
@@ -293,14 +312,15 @@ class TVReferenceGate:
         best_score = -2.0
         best_delay = self.reference_delay
         best_ref_rms = 0.0
-        for offset in range(-search_steps, search_steps + 1):
-            delay = max(0.0, self.reference_delay + offset * step)
+
+        def consider_delay(delay: float) -> None:
+            nonlocal best_score, best_delay, best_ref_rms
             target_end = p_end - delay
             idx = int(np.argmin(np.abs(ref_times - target_end)))
             if idx + 1 < nwin:
-                continue
+                return
             if abs(reference[idx].at - target_end) > 0.045:
-                continue
+                return
             rframes = reference[idx - nwin + 1 : idx + 1]
             r = np.stack([item.feature for item in rframes])
             score = feature_match_score(p, r)
@@ -310,6 +330,28 @@ class TVReferenceGate:
                 best_ref_rms = math.sqrt(
                     sum(item.rms * item.rms for item in rframes) / len(rframes)
                 )
+
+        local_delays = {
+            round(max(0.0, self.reference_delay + offset * step), 6)
+            for offset in range(-search_steps, search_steps + 1)
+        }
+        local_delays.add(0.0)
+        for delay in sorted(local_delays):
+            consider_delay(delay)
+
+        # Reader scheduling and PulseAudio buffering can move the effective
+        # physical-vs-HDMI delay well outside the narrow learned window.  A low
+        # local score is therefore ambiguous: it may be a real near-end speaker,
+        # or simply a temporarily stale delay estimate.  Before declaring near-end,
+        # retry across the full plausible acoustic path.  This runs only on weak
+        # matches, so the normal fast path stays cheap.
+        if best_score < self.match_floor:
+            fallback_steps = int(round(self.fallback_max_delay_seconds / step))
+            for index in range(fallback_steps + 1):
+                delay = round(index * step, 6)
+                if delay in local_delays:
+                    continue
+                consider_delay(delay)
 
         if best_score <= -1.5:
             self._last_match = _ContentMatch()
@@ -365,15 +407,46 @@ class TVReferenceGate:
         self._last_decision = decision
         return decision
 
+    def classify_wake_candidate(self, pcm16: bytes) -> TVGateDecision:
+        """Classify standby audio for wake authorization without muting the mic."""
+        decision = self.observe(pcm16, learn=True)
+        if not self.wake_guard_enabled:
+            return decision
+        now = time.monotonic()
+        observer_ready = bool(
+            self.observer_enabled
+            and len(self._reader_tasks) >= 2
+            and decision.match_score is not None
+        )
+        if not observer_ready or decision.ref_rms < self.reference_active_rms:
+            return decision
+        if decision.near_end_hold:
+            return decision
+        if (
+            decision.match_score < decision.match_threshold
+            and decision.mic_rms >= self.absolute_near_end_rms
+        ):
+            self._near_end_until = now + self.near_end_hold_seconds
+            decision.near_end_hold = True
+            self._last_decision = decision
+            return decision
+        decision.probable_tv_only = True
+        self._last_decision = decision
+        return decision
+
     def classify_active(self, pcm16: bytes) -> TVGateDecision:
-        """Classify post-wake audio using physical-mic/HDMI content matching."""
+        """Classify post-wake audio; suppression may remain disabled in observe-only mode."""
         decision = self.observe(pcm16, learn=False)
         now = time.monotonic()
+        observer_ready = bool(
+            self.observer_enabled
+            and len(self._reader_tasks) >= 2
+            and decision.match_score is not None
+        )
         if (
-            not self.enabled
-            or not decision.ready
+            not observer_ready
             or decision.ref_rms < self.reference_active_rms
-            or decision.match_score is None
+            or (self.enabled and not decision.ready)
         ):
             self._passed_chunks += 1
             return decision
@@ -385,7 +458,7 @@ class TVReferenceGate:
         # Near-end requires two independent facts: the physical microphone no
         # longer resembles HDMI content, and the final post-AEC stream contains
         # meaningful energy. A loud actor can satisfy the second condition, but
-        # keeps a high HDMI match and therefore remains suppressed.
+        # keeps a high HDMI match and is classified as probable TV-only.
         if (
             decision.match_score < decision.match_threshold
             and decision.mic_rms >= self.absolute_near_end_rms
@@ -395,19 +468,42 @@ class TVReferenceGate:
             self._passed_chunks += 1
             return decision
 
-        decision.suppress = True
-        self._suppressed_chunks += 1
+        decision.probable_tv_only = True
+        if self.enabled:
+            decision.suppress = True
+            self._suppressed_chunks += 1
+        else:
+            # Observe-only mode is intentionally non-invasive.
+            self._passed_chunks += 1
         return decision
 
     def recent_tv_only(self) -> bool:
         decision = self._last_decision
         return bool(decision and decision.suppress and not decision.near_end_hold)
 
+    def recent_probable_tv_only(self) -> bool:
+        decision = self._last_decision
+        return bool(decision and decision.probable_tv_only and not decision.near_end_hold)
+
     def snapshot(self) -> dict[str, object]:
         decision = self._last_decision
         return {
             "enabled": self.enabled,
+            "observer_enabled": self.observer_enabled,
+            "activity_guard_enabled": self.activity_guard_enabled,
+            "wake_guard_enabled": self.wake_guard_enabled,
+            "mode": (
+                "suppress" if self.enabled else
+                ("activity_guard" if self.observer_enabled and self.activity_guard_enabled else
+                 ("observe_only" if self.observer_enabled else "off"))
+            ),
             "ready": bool(decision.ready) if decision else False,
+            "observer_ready": bool(
+                self.observer_enabled
+                and decision
+                and decision.match_score is not None
+                and len(self._reader_tasks) >= 2
+            ),
             "training_samples": len(self._match_history),
             "reference_delay_ms": round(self.reference_delay * 1000.0, 1),
             "reference_rms": round(decision.ref_rms, 6) if decision else 0.0,
@@ -417,7 +513,7 @@ class TVReferenceGate:
             "match_threshold": round(decision.match_threshold, 4) if decision else round(self._match_threshold(), 4),
             "near_end_min_rms": self.absolute_near_end_rms,
             "decision_delay_ms": round(self.decision_delay_seconds * 1000.0, 1),
-            "tv_only": bool(decision.suppress) if decision else False,
+            "tv_only": bool(decision.probable_tv_only) if decision else False,
             "near_end_hold": bool(decision.near_end_hold) if decision else False,
             "suppressed_chunks": self._suppressed_chunks,
             "passed_chunks": self._passed_chunks,

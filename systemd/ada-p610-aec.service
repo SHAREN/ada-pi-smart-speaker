@@ -9,6 +9,7 @@ PartOf=pipewire-pulse.service
 Type=oneshot
 RemainAfterExit=yes
 Environment=XDG_RUNTIME_DIR=%t
+Environment=ADA_TV_SUPPRESSION_ENABLED=false
 ExecStart=%h/ada-pi/scripts/p610-aec.sh start
 ExecStop=%h/ada-pi/scripts/p610-aec.sh stop
 
