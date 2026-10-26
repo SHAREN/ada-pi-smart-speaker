@@ -6,6 +6,94 @@ spoken behavior.  This module deliberately has no runtime or Gemini dependency.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum
+
+
+class ResponseClass(str, Enum):
+    """Product-facing delivery class for a completed assistant turn."""
+
+    SILENT_SUCCESS = "SILENT_SUCCESS"
+    CUE_SUCCESS = "CUE_SUCCESS"
+    SHORT_CONFIRMATION = "SHORT_CONFIRMATION"
+    SHORT_ANSWER = "SHORT_ANSWER"
+    CLARIFY = "CLARIFY"
+    ERROR = "ERROR"
+    LONG_FORM = "LONG_FORM"
+
+
+class ResponseScenario(str, Enum):
+    """Canonical scenarios used to keep response delivery deterministic."""
+
+    SEMANTIC_END_SUCCESS = "semantic_end_success"
+    SIMPLE_HOME_ACTION_SUCCESS = "simple_home_action_success"
+    SETPOINT_SUCCESS = "setpoint_success"
+    STATE_QUERY = "state_query"
+    AMBIGUOUS_TARGET = "ambiguous_target"
+    FAILED_ACTION = "failed_action"
+    DETAILED_REQUEST = "detailed_request"
+
+
+@dataclass(frozen=True, slots=True)
+class ResponsePolicy:
+    """Delivery constraints for one response class.
+
+    This is declarative Phase-1 policy. Runtime wiring belongs in a later,
+    separately reviewed slice so defining the contract cannot change current
+    voice behavior by itself.
+    """
+
+    speak: bool
+    cue: bool
+    max_sentences: int | None
+    question_allowed: bool
+
+
+RESPONSE_POLICIES: dict[ResponseClass, ResponsePolicy] = {
+    ResponseClass.SILENT_SUCCESS: ResponsePolicy(
+        speak=False, cue=False, max_sentences=0, question_allowed=False
+    ),
+    ResponseClass.CUE_SUCCESS: ResponsePolicy(
+        speak=False, cue=True, max_sentences=0, question_allowed=False
+    ),
+    ResponseClass.SHORT_CONFIRMATION: ResponsePolicy(
+        speak=True, cue=False, max_sentences=1, question_allowed=False
+    ),
+    ResponseClass.SHORT_ANSWER: ResponsePolicy(
+        speak=True, cue=False, max_sentences=2, question_allowed=False
+    ),
+    ResponseClass.CLARIFY: ResponsePolicy(
+        speak=True, cue=False, max_sentences=1, question_allowed=True
+    ),
+    ResponseClass.ERROR: ResponsePolicy(
+        speak=True, cue=False, max_sentences=1, question_allowed=False
+    ),
+    ResponseClass.LONG_FORM: ResponsePolicy(
+        speak=True, cue=False, max_sentences=None, question_allowed=False
+    ),
+}
+
+
+SCENARIO_RESPONSE_CLASSES: dict[ResponseScenario, ResponseClass] = {
+    ResponseScenario.SEMANTIC_END_SUCCESS: ResponseClass.SILENT_SUCCESS,
+    ResponseScenario.SIMPLE_HOME_ACTION_SUCCESS: ResponseClass.CUE_SUCCESS,
+    ResponseScenario.SETPOINT_SUCCESS: ResponseClass.SHORT_CONFIRMATION,
+    ResponseScenario.STATE_QUERY: ResponseClass.SHORT_ANSWER,
+    ResponseScenario.AMBIGUOUS_TARGET: ResponseClass.CLARIFY,
+    ResponseScenario.FAILED_ACTION: ResponseClass.ERROR,
+    ResponseScenario.DETAILED_REQUEST: ResponseClass.LONG_FORM,
+}
+
+
+def response_policy(response_class: ResponseClass) -> ResponsePolicy:
+    """Return the immutable delivery contract for ``response_class``."""
+    return RESPONSE_POLICIES[response_class]
+
+
+def response_class_for_scenario(scenario: ResponseScenario) -> ResponseClass:
+    """Map a canonical product scenario to its default response class."""
+    return SCENARIO_RESPONSE_CLASSES[scenario]
+
 
 DEFAULT_ADA_INSTRUCTIONS = """You are Ada, a polished, highly capable voice assistant running on a Raspberry Pi desk companion.
 
