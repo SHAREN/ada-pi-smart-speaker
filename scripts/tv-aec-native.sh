@@ -3,6 +3,13 @@ set -euo pipefail
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
+case "${ADA_TV_SUPPRESSION_ENABLED:-true}" in
+  0|false|FALSE|no|NO|off|OFF)
+    echo "TV/HDMI suppression disabled by ADA_TV_SUPPRESSION_ENABLED"
+    exit 0
+    ;;
+esac
+
 P610_SOURCE=""
 
 # WirePlumber creates physical nodes after PipeWire starts. Wait until the P610

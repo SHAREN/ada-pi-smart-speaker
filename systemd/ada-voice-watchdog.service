@@ -5,4 +5,5 @@ After=ada-pi.service ada-p610-aec.service
 [Service]
 Type=oneshot
 Environment=XDG_RUNTIME_DIR=%t
+Environment=ADA_TV_SUPPRESSION_ENABLED=false
 ExecStart=/usr/bin/python3 %h/ada-pi/scripts/voice-watchdog.py

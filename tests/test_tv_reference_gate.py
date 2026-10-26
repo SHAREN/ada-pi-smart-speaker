@@ -6,6 +6,7 @@ import numpy as np
 from backend.tv_reference_gate import (
     TVReferenceGate,
     _ContentMatch,
+    _FeatureFrame,
     feature_match_score,
     pcm16_rms,
 )
@@ -67,6 +68,35 @@ class TVReferenceGateTests(unittest.TestCase):
         self.assertGreater(decision.match_score, decision.match_threshold)
         self.assertTrue(decision.suppress)
 
+    def test_observe_only_mode_classifies_tv_without_suppressing_audio(self) -> None:
+        self.gate.enabled = False
+        self.gate.observer_enabled = True
+        self.gate._match_history.clear()
+        self.use_match(0.58, physical_rms=0.08)
+        decision = self.gate.classify_active(pcm(0.035))
+        self.assertFalse(decision.ready)
+        self.assertTrue(decision.probable_tv_only)
+        self.assertFalse(decision.suppress)
+        self.assertTrue(self.gate.recent_probable_tv_only())
+        self.assertFalse(self.gate.recent_tv_only())
+
+    def test_wake_candidate_from_hdmi_content_is_rejected_without_muting(self) -> None:
+        self.gate.enabled = False
+        self.gate.wake_guard_enabled = True
+        self.use_match(0.58, physical_rms=0.08)
+        decision = self.gate.classify_wake_candidate(pcm(0.003))
+        self.assertTrue(decision.probable_tv_only)
+        self.assertFalse(decision.suppress)
+        self.assertFalse(decision.near_end_hold)
+
+    def test_wake_candidate_with_near_end_voice_remains_allowed(self) -> None:
+        self.gate.enabled = False
+        self.gate.wake_guard_enabled = True
+        self.use_match(0.12, physical_rms=0.08)
+        decision = self.gate.classify_wake_candidate(pcm(0.02))
+        self.assertFalse(decision.probable_tv_only)
+        self.assertTrue(decision.near_end_hold)
+
     def test_unmatched_near_end_voice_opens_gate_and_holds_quiet_syllable(self) -> None:
         self.use_match(0.15)
         loud = self.gate.classify_active(pcm(0.02))
@@ -98,6 +128,29 @@ class TVReferenceGateTests(unittest.TestCase):
         self.assertGreaterEqual(threshold, self.gate.match_floor)
         self.assertLessEqual(threshold, self.gate.match_ceiling)
         self.assertGreater(threshold, 0.30)
+
+    def test_fallback_search_recovers_when_learned_delay_is_stale(self) -> None:
+        gate = TVReferenceGate()
+        gate.reference_delay = 0.30
+        gate.delay_search_seconds = 0.06
+        gate.fallback_max_delay_seconds = 0.50
+        gate.match_interval_seconds = 0.0
+        gate.match_window_seconds = 0.50
+        rng = np.random.default_rng(42)
+        start = 1000.0
+        for index in range(40):
+            feature = rng.normal(size=12)
+            at = start + index * 0.02
+            gate._physical_features.append(
+                _FeatureFrame(at=at, feature=feature.copy(), rms=0.03)
+            )
+            gate._reference_features.append(
+                _FeatureFrame(at=at, feature=feature.copy(), rms=0.05)
+            )
+        match = gate._content_match()
+        self.assertTrue(match.ready)
+        self.assertGreater(match.score, 0.95)
+        self.assertLessEqual(match.delay_seconds, 0.02)
 
 
 if __name__ == "__main__":

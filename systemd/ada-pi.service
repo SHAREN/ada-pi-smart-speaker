@@ -3,6 +3,7 @@ Description=ADA Pi smart-speaker service
 After=network-online.target pipewire-pulse.service wireplumber.service ada-p610-aec.service
 Wants=network-online.target
 Requires=ada-p610-aec.service
+PartOf=ada-p610-aec.service
 
 [Service]
 Type=simple
@@ -16,6 +17,7 @@ Environment=XAUTHORITY=%h/.Xauthority
 Environment=ADA_HOST=127.0.0.1
 Environment=ADA_PORT=18765
 Environment=ADA_VIDEO_MODE=activity
+Environment=ADA_TV_SUPPRESSION_ENABLED=false
 Environment=ADA_CHROMIUM_PROFILE=%h/.config/ada-pi-chromium
 ExecStart=%h/ada-pi/start.sh
 Restart=always

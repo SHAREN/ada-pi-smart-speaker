@@ -21,6 +21,53 @@ unload_existing() {
   rm -f "$MODULE_FILE"
 }
 
+find_module_playback_input() {
+  local module_id="$1"
+  local p610_sink="$2"
+  pactl -f json list sink-inputs 2>/dev/null | python3 -c '
+import json, sys
+module_id, target = sys.argv[1], sys.argv[2]
+try:
+    items = json.load(sys.stdin)
+except Exception:
+    items = []
+for item in items:
+    props = item.get("properties") or {}
+    owner = str(item.get("owner_module") or "")
+    exact_target = (
+        props.get("node.name") == "echo-cancel-playback"
+        and props.get("target.object") == target
+    )
+    if owner == module_id or exact_target:
+        print(item.get("index", ""))
+        break
+' "$module_id" "$p610_sink"
+}
+
+pin_module_playback_to_p610() {
+  local module_id="$1"
+  local p610_sink="$2"
+  local input_id=""
+
+  # PipeWire stream-restore can override module-echo-cancel's sink_master at
+  # graph creation time. target.object may still say P610 while the *actual*
+  # Sink points at HDMI, so force the newly-created module's render stream onto
+  # the physical P610 and let the watchdog enforce the same invariant later.
+  # PipeWire can publish the sink-input a few seconds after pactl load-module
+  # returns, especially directly after boot, so allow a bounded 10s settle.
+  for _ in $(seq 1 100); do
+    input_id="$(find_module_playback_input "$module_id" "$p610_sink" || true)"
+    if [[ -n "$input_id" ]]; then
+      pactl move-sink-input "$input_id" "$p610_sink"
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  echo "ADA echo-cancel playback stream was not created for module $module_id" >&2
+  return 1
+}
+
 case "${1:-start}" in
   start)
     # Wait briefly for pipewire-pulse and the USB profile to appear after login/restart.
@@ -41,15 +88,19 @@ case "${1:-start}" in
     fi
 
     # The optional TV-AEC service starts in parallel with the P610 service.
-    # Give it a short window to publish ada_tv_aec_source so the self-AEC can
-    # reliably cascade on clean boot. If it is unavailable, fall back safely
-    # to the physical P610 microphone.
+    # When TV suppression is disabled, bypass that stage completely and use
+    # the physical P610 microphone as the capture master.
     TV_AEC_SOURCE=""
-    for _ in $(seq 1 15); do
-      TV_AEC_SOURCE="$(pactl list short sources 2>/dev/null | awk '$2 == "ada_tv_aec_source" {print $2; exit}')"
-      [[ -n "$TV_AEC_SOURCE" ]] && break
-      sleep 0.2
-    done
+    TV_SUPPRESSION_ENABLED="${ADA_TV_SUPPRESSION_ENABLED:-true}"
+    case "${TV_SUPPRESSION_ENABLED,,}" in
+      1|true|yes|on)
+        for _ in $(seq 1 15); do
+          TV_AEC_SOURCE="$(pactl list short sources 2>/dev/null | awk '$2 == "ada_tv_aec_source" {print $2; exit}')"
+          [[ -n "$TV_AEC_SOURCE" ]] && break
+          sleep 0.2
+        done
+        ;;
+    esac
 
     unload_existing
 
@@ -66,9 +117,11 @@ case "${1:-start}" in
       sink_master="$P610_SINK" \
       source_name=ada_aec_source \
       sink_name=ada_aec_sink \
+      sink_properties="priority.session=1 priority.driver=1" \
       use_master_format=1)"
 
     printf '%s\n' "$MODULE_ID" > "$MODULE_FILE"
+    pin_module_playback_to_p610 "$MODULE_ID" "$P610_SINK"
     # Keep the physical P610 at a usable speech level. The old 40% setting
     # mapped to a very low USB hardware PCM level and made Gemini replies
     # effectively inaudible even though playback was active.
