@@ -113,6 +113,18 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("window.idleFace?.setConnecting(true);\nconnect();", app)
         self.assertNotIn('\nconnectButton.addEventListener', app)
 
+    def test_voice_recovery_replays_overlap_only_after_explicit_recovery(self) -> None:
+        backend = (ROOT / "backend/main.py").read_text()
+        provider = (ROOT / "backend/realtime_provider.py").read_text()
+        self.assertNotIn('flush_overlap_turn("provider_recovered")', backend)
+        self.assertIn('overlap_replay_authorized_reason = "provider_reconnected"', backend)
+        self.assertIn('overlap_replay_authorized_reason = "response_stall_recovered"', backend)
+        self.assertIn("stall_recovery_pending = True", backend)
+        self.assertIn("if stall_recovery_pending:", backend)
+        self.assertIn("and overlap_replay_authorized_reason", backend)
+        self.assertIn("if len(inline_data.data) <= 2:", provider)
+        self.assertIn("ignoring zero-duration assistant PCM sentinel", provider)
+
     def test_video_uses_native_pi_camera_without_touching_browser_audio(self) -> None:
         app = (ROOT / "frontend/app.js").read_text()
         provider = (ROOT / "backend/realtime_provider.py").read_text()
@@ -267,7 +279,9 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("ADA_RESPONSE_STALL_TIMEOUT_SECONDS", backend)
         self.assertIn("response_stall_timeout", backend)
         self.assertIn("provider_reconnect_response_recovery", backend)
-        self.assertIn('await flush_overlap_turn("provider_recovered")', backend)
+        self.assertIn('overlap_replay_authorized_reason = "provider_reconnected"', backend)
+        self.assertIn('overlap_replay_authorized_reason = "response_stall_recovered"', backend)
+        self.assertNotIn('await flush_overlap_turn("provider_recovered")', backend)
         self.assertIn("event: 'drained'", app)
         self.assertIn("!this.queue.length && this.bufferedSamples <= 0 && !this.drainReported", app)
         self.assertIn('if (data.event === "drained") assistantPlaybackActive = false;', app)

@@ -692,6 +692,9 @@ async def voice_socket(browser: WebSocket) -> None:
     # Kept in status for compatibility/diagnostics only. Local VAD boundaries are
     # not Gemini turn boundaries, so this value must never drive response routing.
     pending_user_turns = 0
+    provider_reconnect_pending = False
+    stall_recovery_pending = False
+    overlap_replay_authorized_reason: str | None = None
     audio_debug_session: AudioDebugSession | None = None
 
     VOICE_RUNTIME_STATE.update(
@@ -867,7 +870,7 @@ async def voice_socket(browser: WebSocket) -> None:
         return
 
     async def browser_to_provider() -> None:
-        nonlocal speech_clear_task, audio_debug_session, local_speech_detected, local_speech_stop_grace_until, tv_gate_armed, manual_activity_active, assistant_playback_locked, playback_drain_wait_started, assistant_echo_guard_until
+        nonlocal speech_clear_task, audio_debug_session, local_speech_detected, local_speech_stop_grace_until, tv_gate_armed, manual_activity_active, assistant_playback_locked, playback_drain_wait_started, assistant_echo_guard_until, overlap_replay_authorized_reason
         raw_packet_count = 0
         forwarded_packet_count = 0
         last_audio_log = time.monotonic()
@@ -1364,11 +1367,14 @@ async def voice_socket(browser: WebSocket) -> None:
                     provider_ready = bool(live_manager.snapshot()["connected"])
                     if (
                         provider_ready
-                        and overlap_turn_pending
+                        and overlap_replay_authorized_reason
                         and not assistant_response_active
                         and not assistant_playback_locked
                     ):
-                        await flush_overlap_turn("provider_recovered")
+                        replay_reason = overlap_replay_authorized_reason
+                        overlap_replay_authorized_reason = None
+                        if overlap_turn_pending:
+                            await flush_overlap_turn(replay_reason)
                     if not activation_cue_done.is_set():
                         # Deliberately discard everything heard during the wake
                         # cue. The user asked for: wake -> cue -> listen.
@@ -1625,12 +1631,15 @@ async def voice_socket(browser: WebSocket) -> None:
         speech_active.clear()
 
     async def provider_to_browser() -> None:
-        nonlocal speech_clear_task, assistant_response_active, assistant_playback_locked, playback_drain_wait_started, last_assistant_audio_at, assistant_echo_guard_until, semantic_close_pending, audio_debug_session, tv_gate_armed, semantic_close_watchdog_task, manual_activity_active
+        nonlocal speech_clear_task, assistant_response_active, assistant_playback_locked, playback_drain_wait_started, last_assistant_audio_at, assistant_echo_guard_until, semantic_close_pending, audio_debug_session, tv_gate_armed, semantic_close_watchdog_task, manual_activity_active, provider_reconnect_pending, stall_recovery_pending, overlap_replay_authorized_reason
         forward_audio = False
         try:
             async for event in provider.events():
                 if event.type == "live_reconnecting":
                     had_stale_response = assistant_response_active or assistant_playback_locked
+                    provider_reconnect_pending = True
+                    stall_recovery_pending = False
+                    overlap_replay_authorized_reason = None
                     assistant_response_active = False
                     assistant_playback_locked = False
                     playback_drain_wait_started = 0.0
@@ -1662,10 +1671,14 @@ async def voice_socket(browser: WebSocket) -> None:
                         await send_json(browser, "response_interrupted", reason="provider_reconnecting")
                     continue
                 if event.type == "live_connected":
+                    if provider_reconnect_pending:
+                        provider_reconnect_pending = False
+                        overlap_replay_authorized_reason = "provider_reconnected"
                     logger.info(
-                        "session=%s Gemini Live connected/reconnected count=%s overlap_pending=%s",
+                        "session=%s Gemini Live connected/reconnected count=%s overlap_pending=%s replay_authorized=%s",
                         session_id, event.data.get("reconnect_count"),
                         VOICE_RUNTIME_STATE.get("overlap_turn_pending"),
+                        overlap_replay_authorized_reason,
                     )
                     continue
                 if event.type == "audio":
@@ -1747,6 +1760,9 @@ async def voice_socket(browser: WebSocket) -> None:
                     VOICE_RUNTIME_STATE["assistant_playback_locked"] = False
                     live_manager.set_playback_busy(False)
                     forward_audio = False
+                    if stall_recovery_pending:
+                        stall_recovery_pending = False
+                        overlap_replay_authorized_reason = "response_stall_recovered"
                     await send_json(browser, "clear_audio")
                     await send_json(browser, event.type)
                 elif event.type == "speech_stopped":
@@ -1884,7 +1900,7 @@ async def voice_socket(browser: WebSocket) -> None:
             closed.set()
 
     async def idle_watch() -> None:
-        nonlocal assistant_response_active, assistant_playback_locked, playback_drain_wait_started, last_assistant_audio_at, assistant_echo_guard_until
+        nonlocal assistant_response_active, assistant_playback_locked, playback_drain_wait_started, last_assistant_audio_at, assistant_echo_guard_until, stall_recovery_pending, overlap_replay_authorized_reason
         while not closed.is_set():
             await asyncio.sleep(0.5)
             if not voice_gate.active:
@@ -1912,6 +1928,8 @@ async def voice_socket(browser: WebSocket) -> None:
                 and time.monotonic() - last_assistant_audio_at >= response_stall_timeout_seconds
             ):
                 stalled_for = time.monotonic() - last_assistant_audio_at
+                stall_recovery_pending = True
+                overlap_replay_authorized_reason = None
                 assistant_response_active = False
                 assistant_playback_locked = False
                 playback_drain_wait_started = 0.0

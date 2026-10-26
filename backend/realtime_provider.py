@@ -1020,6 +1020,13 @@ class GeminiLiveProvider(RealtimeProvider):
                                 response_max_audio_gap = 0.0
                                 response_max_jitter_deficit = 0.0
                                 yield ProviderEvent("response_started", {})
+                            if len(inline_data.data) <= 2:
+                                logger.warning(
+                                    "session=%s ignoring zero-duration assistant PCM sentinel bytes=%d",
+                                    self.session_id,
+                                    len(inline_data.data),
+                                )
+                                continue
                             now = time.monotonic()
                             chunk_gap = (now - response_last_audio_at) if response_last_audio_at else 0.0
                             jitter_deficit = max(0.0, chunk_gap - response_last_audio_duration) if response_last_audio_at else 0.0

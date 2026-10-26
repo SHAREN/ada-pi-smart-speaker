@@ -160,6 +160,21 @@ class ThinkingSignalToolSession(ExpressionToolSession):
         self.provider._closed = True
 
 
+class TinyAudioSentinelSession:
+    def __init__(self, provider: GeminiLiveProvider) -> None:
+        self.provider = provider
+
+    async def receive(self):
+        yield types.LiveServerMessage(
+            server_content=types.LiveServerContent(
+                model_turn=types.Content(parts=[
+                    types.Part(inline_data=types.Blob(data=b"\x00\x00", mime_type="audio/pcm;rate=24000"))
+                ])
+            )
+        )
+        self.provider._closed = True
+
+
 class ProviderEventTests(unittest.IsolatedAsyncioTestCase):
     def test_live_config_guards_long_full_duplex_sessions(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "backend/realtime_provider.py").read_text()
@@ -206,6 +221,12 @@ class ProviderEventTests(unittest.IsolatedAsyncioTestCase):
         provider._session = InterruptedSession(provider)
         events = [event async for event in provider.events()]
         self.assertEqual([event.type for event in events], ["response_interrupted"])
+
+    async def test_zero_duration_pcm_sentinel_starts_response_without_audio_event(self) -> None:
+        provider = GeminiLiveProvider()
+        provider._session = TinyAudioSentinelSession(provider)
+        events = [event async for event in provider.events()]
+        self.assertEqual([event.type for event in events], ["response_started"])
 
     async def test_expression_tool_is_forwarded_and_spoken_reply_can_continue(self) -> None:
         provider = GeminiLiveProvider()
