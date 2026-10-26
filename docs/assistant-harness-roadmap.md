@@ -1,7 +1,7 @@
 # ADA/Nabu — Product-grade Voice Assistant Harness roadmap
 
-Status: active implementation roadmap  
-Umbrella issue: https://github.com/SHAREN/ada-pi-smart-speaker/issues/1  
+Status: active implementation roadmap
+Umbrella issue: https://github.com/SHAREN/ada-pi-smart-speaker/issues/1
 Scope: ADA/Nabu on Raspberry Pi 5 + Gemini Live + Home Assistant MCP + Plantronics P610
 
 ## Goal
