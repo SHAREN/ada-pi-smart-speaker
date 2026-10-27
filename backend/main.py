@@ -1707,6 +1707,10 @@ async def voice_socket(browser: WebSocket) -> None:
                         audio_debug_session.write_assistant_raw(pcm_out)
                         audio_debug_session.record_event("assistant_chunk_received", chunk_trace)
                     if forward_audio and (voice_gate.active or semantic_close_pending):
+                        if not assistant_playback_locked:
+                            assistant_playback_locked = True
+                            VOICE_RUNTIME_STATE["assistant_playback_locked"] = True
+                            live_manager.set_playback_busy(True)
                         send_started = time.monotonic()
                         await browser.send_bytes(pcm_out)
                         send_ms = (time.monotonic() - send_started) * 1000.0
@@ -1869,15 +1873,15 @@ async def voice_socket(browser: WebSocket) -> None:
                     tv_gate_armed = True
                     VOICE_RUNTIME_STATE["tv_gate_armed"] = True
                     assistant_response_active = True
-                    assistant_playback_locked = True
                     playback_drain_wait_started = 0.0
                     assistant_response_started_at = time.monotonic()
                     assistant_audio_seen = False
                     last_assistant_audio_at = 0.0
                     assistant_echo_guard_until = 0.0
                     VOICE_RUNTIME_STATE["assistant_response_active"] = True
-                    VOICE_RUNTIME_STATE["assistant_playback_locked"] = True
-                    live_manager.set_playback_busy(True)
+                    # A model response is not physical playback until the first
+                    # real PCM chunk arrives. Empty/sentinel-only responses must
+                    # never pin the playback lock or block later user speech.
                     if voice_gate.active:
                         voice_gate.note_activity()
                     logger.info("session=%s duplex response_started", session_id)
