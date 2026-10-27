@@ -1234,7 +1234,9 @@ function handleControl(event) {
       logElement.scrollTop = logElement.scrollHeight;
       break;
     case "response_started":
-      assistantPlaybackActive = true;
+      // Gemini may start a response but never deliver real PCM. Do not mark
+      // physical playback active until the first binary audio chunk arrives.
+      assistantPlaybackActive = false;
       assistantAudioChunkSequence = 0;
       armAssistantZeroAudioTimer();
       assistantLastWsChunkAt = 0;
@@ -1323,6 +1325,7 @@ async function connect() {
       const wsGapMs = assistantLastWsChunkAt ? Math.round((now - assistantLastWsChunkAt) * 10) / 10 : 0;
       assistantLastWsChunkAt = now;
       clearAssistantZeroAudioTimer();
+      if ((message.data?.byteLength || 0) > 0) assistantPlaybackActive = true;
       assistantAudioChunkSequence += 1;
       playbackNode?.port.postMessage({
         type: "audio_chunk", pcm: message.data,

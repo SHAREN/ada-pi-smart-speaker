@@ -298,10 +298,25 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("event: 'drained'", app)
         self.assertIn("!this.queue.length && this.bufferedSamples <= 0 && !this.drainReported", app)
         self.assertIn('if (data.event === "drained") assistantPlaybackActive = false;', app)
+        response_started_block = app.split('case "response_started":', 1)[1].split('case "response_completed":', 1)[0]
+        self.assertIn("assistantPlaybackActive = false", response_started_block)
+        self.assertNotIn("assistantPlaybackActive = true", response_started_block)
+        self.assertIn('if ((message.data?.byteLength || 0) > 0) assistantPlaybackActive = true;', app)
         response_completed_block = app.split('case "response_completed":', 1)[1].split('case "response_interrupted":', 1)[0]
         self.assertIn("assistantAudioChunkSequence === 0", response_completed_block)
         nonempty_path = response_completed_block.split("} else {", 1)[1]
         self.assertNotIn("assistantPlaybackActive = false", nonempty_path)
+        backend_response_started = backend.split('elif event.type == "response_started":', 1)[1].split('elif event.type == "response_completed":', 1)[0]
+        self.assertNotIn("assistant_playback_locked = True", backend_response_started)
+        self.assertNotIn("live_manager.set_playback_busy(True)", backend_response_started)
+        backend_audio = backend.split('if event.type == "audio":', 1)[1].split('elif event.type == "speech_started":', 1)[0]
+        self.assertIn("assistant_playback_locked = True", backend_audio)
+        self.assertIn("live_manager.set_playback_busy(True)", backend_audio)
+        local_speech_block = backend.split('if control.get("type") == "local_speech_started":', 1)[1].split('elif control.get("type") == "playback_telemetry":', 1)[0]
+        playback_window = local_speech_block.split("assistant_playback_window = bool(", 1)[1].split(")\n", 1)[0]
+        self.assertIn("assistant_playback_locked", playback_window)
+        self.assertIn('control.get("playback_active")', playback_window)
+        self.assertNotIn("assistant_response_active", playback_window)
 
     def test_home_assistant_device_page_and_local_controls(self) -> None:
         html = (ROOT / "frontend/index.html").read_text()
