@@ -17,7 +17,13 @@ from typing import Any
 from google import genai
 from google.genai import types
 
-from .assistant_harness import DEFAULT_ADA_INSTRUCTIONS, build_assistant_instructions
+from .assistant_harness import (
+    DEFAULT_ADA_INSTRUCTIONS,
+    ResponseScenario,
+    build_assistant_instructions,
+    response_class_for_scenario,
+    response_policy,
+)
 from .ha_mcp_voice import VOICE_TOOL_NAMES, call_voice_tool, get_voice_tool_declarations
 from .speaker_clock import CLOCK_TOOL_DECLARATIONS, CLOCK_TOOL_NAMES, speaker_clock
 from .web_tools import WEB_TOOL_DECLARATIONS, web_read, web_search
@@ -811,7 +817,14 @@ class GeminiLiveProvider(RealtimeProvider):
                                     "success": True,
                                     "instruction": "Close silently. Do not generate any spoken farewell or follow-up.",
                                 }
-                                response_scheduling = types.FunctionResponseScheduling.SILENT
+                                response_class = response_class_for_scenario(
+                                    ResponseScenario.SEMANTIC_END_SUCCESS
+                                )
+                                response_scheduling = (
+                                    types.FunctionResponseScheduling.SILENT
+                                    if not response_policy(response_class).speak
+                                    else types.FunctionResponseScheduling.WHEN_IDLE
+                                )
                             else:
                                 logger.warning(
                                     "session=%s semantic end tool ignored without a current user transcript or fresh voice turn reason=%r",
@@ -861,9 +874,24 @@ class GeminiLiveProvider(RealtimeProvider):
                             ):
                                 feedback_kind = str(result.pop("_voice_feedback", "") or "")
                                 if feedback_kind in {"on", "off"}:
-                                    control_feedback_kind = feedback_kind
-                                silent_control_completed = True
-                                response_scheduling = types.FunctionResponseScheduling.SILENT
+                                    response_class = response_class_for_scenario(
+                                        ResponseScenario.SIMPLE_HOME_ACTION_SUCCESS
+                                    )
+                                    delivery_policy = response_policy(response_class)
+                                    if delivery_policy.cue:
+                                        control_feedback_kind = feedback_kind
+                                    silent_control_completed = not delivery_policy.speak
+                                    response_scheduling = (
+                                        types.FunctionResponseScheduling.SILENT
+                                        if not delivery_policy.speak
+                                        else types.FunctionResponseScheduling.WHEN_IDLE
+                                    )
+                                else:
+                                    # Preserve the current baseline for other successful
+                                    # mutations until their spoken response classes are
+                                    # wired in a separately reviewed slice.
+                                    silent_control_completed = True
+                                    response_scheduling = types.FunctionResponseScheduling.SILENT
                         else:
                             result = {"error": "Unsupported or unavailable function"}
                         function_responses.append(types.FunctionResponse(
