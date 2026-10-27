@@ -125,6 +125,19 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("if len(inline_data.data) <= 2:", provider)
         self.assertIn("ignoring zero-duration assistant PCM sentinel", provider)
 
+    def test_zero_audio_response_cannot_leave_browser_playback_locked(self) -> None:
+        backend = (ROOT / "backend/main.py").read_text()
+        app = (ROOT / "frontend/app.js").read_text()
+        self.assertIn("ADA_RESPONSE_FIRST_AUDIO_TIMEOUT_SECONDS", backend)
+        self.assertIn("response_first_audio_timeout", backend)
+        self.assertIn("assistant_audio_seen", backend)
+        self.assertIn("and assistant_audio_seen", backend)
+        self.assertIn("ASSISTANT_ZERO_AUDIO_FAILSAFE_MS", app)
+        self.assertIn("armAssistantZeroAudioTimer", app)
+        self.assertIn("assistantAudioChunkSequence === 0", app)
+        self.assertIn('event: "zero_audio_timeout"', app)
+        self.assertIn('reason: "zero_audio_response_completed"', app)
+
     def test_video_uses_native_pi_camera_without_touching_browser_audio(self) -> None:
         app = (ROOT / "frontend/app.js").read_text()
         provider = (ROOT / "backend/realtime_provider.py").read_text()
@@ -286,7 +299,9 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("!this.queue.length && this.bufferedSamples <= 0 && !this.drainReported", app)
         self.assertIn('if (data.event === "drained") assistantPlaybackActive = false;', app)
         response_completed_block = app.split('case "response_completed":', 1)[1].split('case "response_interrupted":', 1)[0]
-        self.assertNotIn("assistantPlaybackActive = false", response_completed_block)
+        self.assertIn("assistantAudioChunkSequence === 0", response_completed_block)
+        nonempty_path = response_completed_block.split("} else {", 1)[1]
+        self.assertNotIn("assistantPlaybackActive = false", nonempty_path)
 
     def test_home_assistant_device_page_and_local_controls(self) -> None:
         html = (ROOT / "frontend/index.html").read_text()
