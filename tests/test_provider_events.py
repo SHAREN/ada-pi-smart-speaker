@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 from google.genai import types
 
+from backend.assistant_harness import RESPONSE_POLICIES, ResponseClass, ResponsePolicy
 from backend.realtime_provider import (
     GeminiLiveProvider,
     _compact_weather_payload,
@@ -425,6 +426,29 @@ class ProviderEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(session.responses[0].response["success"])
         self.assertTrue(session.responses[0].response["blocked"])
 
+    async def test_semantic_end_scheduling_follows_response_policy(self) -> None:
+        provider = GeminiLiveProvider()
+        session = EndConversationToolSession(provider)
+        provider._session = session
+        spoken_policy = ResponsePolicy(
+            speak=True,
+            cue=False,
+            max_sentences=1,
+            question_allowed=False,
+        )
+        with patch.dict(
+            RESPONSE_POLICIES,
+            {ResponseClass.SILENT_SUCCESS: spoken_policy},
+        ):
+            events = [event async for event in provider.events()]
+        self.assertEqual([(event.type, event.data) for event in events], [
+            ("semantic_end_requested", {"reason": "user said goodbye"})
+        ])
+        self.assertEqual(
+            session.responses[0].scheduling,
+            types.FunctionResponseScheduling.WHEN_IDLE,
+        )
+
     async def test_successful_home_assistant_control_result_is_silent(self) -> None:
         provider = GeminiLiveProvider()
         session = HomeAssistantControlToolSession(provider)
@@ -441,6 +465,33 @@ class ProviderEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.responses[0].name, "ha_call_service")
         self.assertEqual(session.responses[0].scheduling, types.FunctionResponseScheduling.SILENT)
         self.assertNotIn("_voice_feedback", session.responses[0].response)
+
+    async def test_home_control_delivery_follows_response_policy(self) -> None:
+        provider = GeminiLiveProvider()
+        session = HomeAssistantControlToolSession(provider)
+        provider._session = session
+        spoken_policy = ResponsePolicy(
+            speak=True,
+            cue=False,
+            max_sentences=1,
+            question_allowed=False,
+        )
+        with (
+            patch.dict(
+                RESPONSE_POLICIES,
+                {ResponseClass.CUE_SUCCESS: spoken_policy},
+            ),
+            patch(
+                "backend.realtime_provider.call_voice_tool",
+                new=AsyncMock(return_value={"success": True, "_voice_feedback": "on"}),
+            ),
+        ):
+            events = [event async for event in provider.events()]
+        self.assertEqual(events, [])
+        self.assertEqual(
+            session.responses[0].scheduling,
+            types.FunctionResponseScheduling.WHEN_IDLE,
+        )
 
     async def test_failed_home_assistant_control_does_not_emit_success_cue(self) -> None:
         provider = GeminiLiveProvider()
