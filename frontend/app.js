@@ -78,6 +78,33 @@ let assistantEntry = null;
 let assistantPlaybackActive = false;
 let assistantAudioChunkSequence = 0;
 let assistantLastWsChunkAt = 0;
+let assistantZeroAudioTimer = null;
+const ASSISTANT_ZERO_AUDIO_FAILSAFE_MS = 7000;
+
+function clearAssistantZeroAudioTimer() {
+  if (assistantZeroAudioTimer !== null) {
+    clearTimeout(assistantZeroAudioTimer);
+    assistantZeroAudioTimer = null;
+  }
+}
+
+function armAssistantZeroAudioTimer() {
+  clearAssistantZeroAudioTimer();
+  assistantZeroAudioTimer = setTimeout(() => {
+    assistantZeroAudioTimer = null;
+    if (!assistantPlaybackActive || assistantAudioChunkSequence !== 0) return;
+    console.warn("assistant response produced no PCM; releasing stale browser playback lock");
+    assistantPlaybackActive = false;
+    playbackNode?.port.postMessage({ type: "clear" });
+    window.idleFace?.setSpeechLevel(0, true);
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({
+        type: "playback_telemetry", event: "zero_audio_timeout",
+        timeout_ms: ASSISTANT_ZERO_AUDIO_FAILSAFE_MS,
+      }));
+    }
+  }, ASSISTANT_ZERO_AUDIO_FAILSAFE_MS);
+}
 let browserEventLoopLagMs = 0;
 let browserEventLoopLagPeakMs = 0;
 let browserEventLoopExpectedAt = performance.now() + 250;
@@ -1191,6 +1218,7 @@ function handleControl(event) {
       microphoneStatus.textContent = "On — listening";
       break;
     case "clear_audio":
+      clearAssistantZeroAudioTimer();
       assistantPlaybackActive = false;
       playbackNode?.port.postMessage({ type: "clear" });
       window.idleFace?.setSpeechLevel(0, true);
@@ -1208,6 +1236,7 @@ function handleControl(event) {
     case "response_started":
       assistantPlaybackActive = true;
       assistantAudioChunkSequence = 0;
+      armAssistantZeroAudioTimer();
       assistantLastWsChunkAt = 0;
       browserEventLoopLagPeakMs = browserEventLoopLagMs;
       assistantEntry = null;
@@ -1225,13 +1254,29 @@ function handleControl(event) {
       }
       break;
     case "response_completed":
-      // Gemini has finished generating, but the AudioWorklet may still have
-      // buffered PCM. Keep playback_active=true until the worklet reports
-      // the queue is physically drained; only then may VAD reopen.
-      playbackNode?.port.postMessage({ type: "flush" });
+      clearAssistantZeroAudioTimer();
+      if (assistantAudioChunkSequence === 0) {
+        // An empty Gemini response has no PCM queue that can physically drain.
+        // Release browser playback immediately and tell the backend to follow
+        // the same drained path instead of leaving VAD blocked forever.
+        assistantPlaybackActive = false;
+        playbackNode?.port.postMessage({ type: "clear" });
+        if (socket?.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({
+            type: "playback_telemetry", event: "drained",
+            reason: "zero_audio_response_completed", buffered_ms: 0,
+          }));
+        }
+      } else {
+        // Gemini has finished generating, but the AudioWorklet may still have
+        // buffered PCM. Keep playback_active=true until the worklet reports
+        // the queue is physically drained; only then may VAD reopen.
+        playbackNode?.port.postMessage({ type: "flush" });
+      }
       assistantEntry = null;
       break;
     case "response_interrupted":
+      clearAssistantZeroAudioTimer();
       assistantPlaybackActive = false;
       window.idleFace?.setSpeechLevel(0, true);
       assistantEntry = null;
@@ -1277,6 +1322,7 @@ async function connect() {
       const now = performance.now();
       const wsGapMs = assistantLastWsChunkAt ? Math.round((now - assistantLastWsChunkAt) * 10) / 10 : 0;
       assistantLastWsChunkAt = now;
+      clearAssistantZeroAudioTimer();
       assistantAudioChunkSequence += 1;
       playbackNode?.port.postMessage({
         type: "audio_chunk", pcm: message.data,

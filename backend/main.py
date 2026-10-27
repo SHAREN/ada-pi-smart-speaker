@@ -680,7 +680,12 @@ async def voice_socket(browser: WebSocket) -> None:
     playback_drain_timeout_seconds = max(
         2.0, float(os.environ.get("ADA_PLAYBACK_DRAIN_TIMEOUT_SECONDS", "4.0"))
     )
+    assistant_response_started_at = 0.0
+    assistant_audio_seen = False
     last_assistant_audio_at = 0.0
+    response_first_audio_timeout_seconds = max(
+        2.0, float(os.environ.get("ADA_RESPONSE_FIRST_AUDIO_TIMEOUT_SECONDS", "5.0"))
+    )
     response_stall_timeout_seconds = max(
         6.0, float(os.environ.get("ADA_RESPONSE_STALL_TIMEOUT_SECONDS", "12.0"))
     )
@@ -704,6 +709,8 @@ async def voice_socket(browser: WebSocket) -> None:
         assistant_playback_locked=False,
         playback_drain_timeout_seconds=playback_drain_timeout_seconds,
         playback_drain_timeout_count=0,
+        response_first_audio_timeout_seconds=response_first_audio_timeout_seconds,
+        response_first_audio_timeout_count=0,
         response_stall_timeout_seconds=response_stall_timeout_seconds,
         response_stall_timeout_count=0,
         provider_reconnect_recovery_count=0,
@@ -1631,7 +1638,7 @@ async def voice_socket(browser: WebSocket) -> None:
         speech_active.clear()
 
     async def provider_to_browser() -> None:
-        nonlocal speech_clear_task, assistant_response_active, assistant_playback_locked, playback_drain_wait_started, last_assistant_audio_at, assistant_echo_guard_until, semantic_close_pending, audio_debug_session, tv_gate_armed, semantic_close_watchdog_task, manual_activity_active, provider_reconnect_pending, stall_recovery_pending, overlap_replay_authorized_reason
+        nonlocal speech_clear_task, assistant_response_active, assistant_playback_locked, playback_drain_wait_started, assistant_response_started_at, assistant_audio_seen, last_assistant_audio_at, assistant_echo_guard_until, semantic_close_pending, audio_debug_session, tv_gate_armed, semantic_close_watchdog_task, manual_activity_active, provider_reconnect_pending, stall_recovery_pending, overlap_replay_authorized_reason
         forward_audio = False
         try:
             async for event in provider.events():
@@ -1643,6 +1650,8 @@ async def voice_socket(browser: WebSocket) -> None:
                     assistant_response_active = False
                     assistant_playback_locked = False
                     playback_drain_wait_started = 0.0
+                    assistant_response_started_at = 0.0
+                    assistant_audio_seen = False
                     last_assistant_audio_at = 0.0
                     assistant_echo_guard_until = time.monotonic() + playback_reopen_delay_seconds
                     VOICE_RUNTIME_STATE["assistant_response_active"] = False
@@ -1682,6 +1691,7 @@ async def voice_socket(browser: WebSocket) -> None:
                     )
                     continue
                 if event.type == "audio":
+                    assistant_audio_seen = True
                     last_assistant_audio_at = time.monotonic()
                     pcm_out = event.data["pcm16"]
                     chunk_sequence = int(event.data.get("sequence") or 0)
@@ -1754,6 +1764,8 @@ async def voice_socket(browser: WebSocket) -> None:
                     assistant_response_active = False
                     assistant_playback_locked = False
                     playback_drain_wait_started = 0.0
+                    assistant_response_started_at = 0.0
+                    assistant_audio_seen = False
                     last_assistant_audio_at = 0.0
                     assistant_echo_guard_until = time.monotonic() + 0.5
                     VOICE_RUNTIME_STATE["assistant_response_active"] = False
@@ -1859,7 +1871,9 @@ async def voice_socket(browser: WebSocket) -> None:
                     assistant_response_active = True
                     assistant_playback_locked = True
                     playback_drain_wait_started = 0.0
-                    last_assistant_audio_at = time.monotonic()
+                    assistant_response_started_at = time.monotonic()
+                    assistant_audio_seen = False
+                    last_assistant_audio_at = 0.0
                     assistant_echo_guard_until = 0.0
                     VOICE_RUNTIME_STATE["assistant_response_active"] = True
                     VOICE_RUNTIME_STATE["assistant_playback_locked"] = True
@@ -1873,6 +1887,8 @@ async def voice_socket(browser: WebSocket) -> None:
                     await send_json(browser, event.type)
                 elif event.type == "response_completed":
                     assistant_response_active = False
+                    assistant_response_started_at = 0.0
+                    assistant_audio_seen = False
                     last_assistant_audio_at = 0.0
                     if assistant_playback_locked:
                         playback_drain_wait_started = time.monotonic()
@@ -1900,7 +1916,7 @@ async def voice_socket(browser: WebSocket) -> None:
             closed.set()
 
     async def idle_watch() -> None:
-        nonlocal assistant_response_active, assistant_playback_locked, playback_drain_wait_started, last_assistant_audio_at, assistant_echo_guard_until, stall_recovery_pending, overlap_replay_authorized_reason
+        nonlocal assistant_response_active, assistant_playback_locked, playback_drain_wait_started, assistant_response_started_at, assistant_audio_seen, last_assistant_audio_at, assistant_echo_guard_until, stall_recovery_pending, overlap_replay_authorized_reason
         while not closed.is_set():
             await asyncio.sleep(0.5)
             if not voice_gate.active:
@@ -1924,6 +1940,47 @@ async def voice_socket(browser: WebSocket) -> None:
                 continue
             if (
                 assistant_response_active
+                and not assistant_audio_seen
+                and assistant_response_started_at > 0.0
+                and time.monotonic() - assistant_response_started_at >= response_first_audio_timeout_seconds
+            ):
+                waited_for_audio = time.monotonic() - assistant_response_started_at
+                stall_recovery_pending = True
+                overlap_replay_authorized_reason = None
+                assistant_response_active = False
+                assistant_playback_locked = False
+                playback_drain_wait_started = 0.0
+                assistant_response_started_at = 0.0
+                assistant_audio_seen = False
+                last_assistant_audio_at = 0.0
+                assistant_echo_guard_until = time.monotonic() + playback_reopen_delay_seconds
+                VOICE_RUNTIME_STATE["assistant_response_active"] = False
+                VOICE_RUNTIME_STATE["assistant_playback_locked"] = False
+                VOICE_RUNTIME_STATE["response_first_audio_timeout_count"] = int(
+                    VOICE_RUNTIME_STATE.get("response_first_audio_timeout_count") or 0
+                ) + 1
+                live_manager.set_playback_busy(False)
+                voice_gate.note_activity()
+                _note_voice_event("response_first_audio_timeout")
+                logger.error(
+                    "session=%s Gemini response produced no real PCM for %.1fs; aborting zero-audio playback state",
+                    session_id, waited_for_audio,
+                )
+                if audio_debug_session is not None:
+                    audio_debug_session.record_event(
+                        "response_first_audio_timeout",
+                        {"waited_seconds": round(waited_for_audio, 3)},
+                    )
+                with suppress(Exception):
+                    await send_json(browser, "clear_audio")
+                    await send_json(browser, "response_interrupted", reason="response_first_audio_timeout")
+                if live_manager.snapshot().get("connected"):
+                    with suppress(Exception):
+                        await asyncio.wait_for(provider.interrupt_response(), timeout=1.5)
+                continue
+            if (
+                assistant_response_active
+                and assistant_audio_seen
                 and last_assistant_audio_at > 0.0
                 and time.monotonic() - last_assistant_audio_at >= response_stall_timeout_seconds
             ):
