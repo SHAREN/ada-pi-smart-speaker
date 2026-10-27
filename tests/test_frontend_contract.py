@@ -312,6 +312,11 @@ class FrontendContractTests(unittest.TestCase):
         backend_audio = backend.split('if event.type == "audio":', 1)[1].split('elif event.type == "speech_started":', 1)[0]
         self.assertIn("assistant_playback_locked = True", backend_audio)
         self.assertIn("live_manager.set_playback_busy(True)", backend_audio)
+        local_speech_block = backend.split('if control.get("type") == "local_speech_started":', 1)[1].split('elif control.get("type") == "playback_telemetry":', 1)[0]
+        playback_window = local_speech_block.split("assistant_playback_window = bool(", 1)[1].split(")\n", 1)[0]
+        self.assertIn("assistant_playback_locked", playback_window)
+        self.assertIn('control.get("playback_active")', playback_window)
+        self.assertNotIn("assistant_response_active", playback_window)
 
     def test_home_assistant_device_page_and_local_controls(self) -> None:
         html = (ROOT / "frontend/index.html").read_text()

@@ -1055,7 +1055,6 @@ async def voice_socket(browser: WebSocket) -> None:
                             voice_gate.active
                             and (
                                 assistant_playback_locked
-                                or assistant_response_active
                                 or time.monotonic() < assistant_echo_guard_until
                             )
                         ),
@@ -1476,7 +1475,6 @@ async def voice_socket(browser: WebSocket) -> None:
                             )
                             assistant_playback_window = bool(
                                 assistant_playback_locked
-                                or assistant_response_active
                                 or bool(control.get("playback_active"))
                             )
                             if assistant_playback_window:
